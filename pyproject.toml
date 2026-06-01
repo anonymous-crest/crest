@@ -1,0 +1,36 @@
+# Copyright (c) 2026 Anonymous Authors
+# SPDX-License-Identifier: BSD-3-Clause
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "crest"
+version = "0.1.0"
+description = "Cross-platform runtime evaluation and search for embedded sensing systems"
+license = { text = "BSD-3-Clause" }
+classifiers = [
+    "License :: OSI Approved :: BSD License",
+]
+dependencies = [
+    "tensorflow",
+    "numpy",
+    "optuna",
+    "pyserial",
+    "pyzmq",
+    "addict",
+    "pyyaml",
+    "keras-tcn",
+    "scikit-learn",
+    "pandas",
+    "numpy-quaternion",
+    "giotto-tda",
+    "pydometer",
+    "tqdm",
+    "soundata==1.0.1",
+    "librosa==0.11.0",
+    "soundfile==0.13.1"
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
