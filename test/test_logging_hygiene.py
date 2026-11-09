@@ -96,7 +96,7 @@ def test_host_filesystem_path_regex_covers_common_absolute_paths() -> None:
         "D:" + "/" + "Users" + "/" + "developer" + "/" + "project",
     ]
     negative_samples = [
-        "https://github.com/anonymous-crest/crest",
+        "https://github.com/example/project",
         "sqlite:///optuna.db",
     ]
 

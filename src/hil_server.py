@@ -8,6 +8,9 @@ and the lazy bootstrap path for dataset, task, and model-family components.
 """
 
 import argparse
+import json
+import uuid
+import sys
 from collections.abc import Mapping
 import logging
 import math
@@ -36,8 +39,8 @@ from crest.hardware import (
     HIL_MASTER_DEVICE_NOT_FOUND,
     describe_error_code,
 )
-from crest.hil_runtime import build_collect_metrics_request, collect_metrics
-from crest.errors import HIL_ERROR_OK, HIL_MASTER_FATAL
+from crest.hil.runtime import build_collect_metrics_request, collect_metrics
+from crest.errors import HIL_ERROR_OK, HIL_MASTER_FATAL, HIL_MASTER_SUCCESS
 from crest.microcontrollers import (
     get_device as get_microcontroller_device,
     resolve_device_options,
@@ -222,7 +225,7 @@ class HILServer:
 
         # Resolve repository root once so sketch variants can be copied before each compile.
         self.repo_root = Path(__file__).resolve().parent.parent
-        self.sketch_variants_dir = self.repo_root / "sketches"
+        self.sketch_variants_dir = self.repo_root / "firmware"
         self.active_sketch_path: Path | None = None
         self.calibration_split: DataSplit | None = None
         self._calibration_split_resolved = False
@@ -854,7 +857,7 @@ class HILServer:
             return base_metrics
         if not request_metrics_args.hil_enabled:
             return base_metrics
-        if int(base_metrics.get("error_code", -1)) != HIL_ERROR_OK:
+        if int(base_metrics.get("error_code", -1)) != HIL_MASTER_SUCCESS:
             return base_metrics
 
         arena_bytes = int(base_metrics.get("arena_bytes", -1))
@@ -875,6 +878,12 @@ class HILServer:
 
         arena_kb = max(1, int(math.ceil(float(arena_bytes) / 1024.0)))
         harness = request_metrics_args.harness
+        # The timer arrives after the full release window, not one invocation.
+        cadence_timeout_s = max(
+            float(request_metrics_args.serial_timeout_s or 12.0),
+            float(request_metrics_args.latency_budget_ms)
+            * int(request_metrics_args.measured_inference_runs) / 1000.0 + 5.0,
+        )
         cadenced_result = runtime_device.evaluate(
             dirpath=prepared_dir,
             arena_kb=arena_kb,
@@ -882,7 +891,7 @@ class HILServer:
             num_channels=int(input_dim),
             serial_port=request_metrics_args.serial_port,
             run_hil=True,
-            serial_timeout_s=float(request_metrics_args.serial_timeout_s or 12.0),
+            serial_timeout_s=cadence_timeout_s,
             measured_inference_runs=int(request_metrics_args.measured_inference_runs),
             dut_ready_timeout_s=request_metrics_args.dut_ready_timeout_s,
             harness_serial_port=None if harness is None else harness.harness_serial_port,
@@ -1165,6 +1174,9 @@ class HILServer:
             **filtered_device_options_overrides,
         }
         merged_device_options["latency_budget_ms"] = float(latency_budget_ms)
+        if self._normalized_device_name() == STM32_BOARD_NAME:
+            merged_device_options["measurement_records_dir"] = str(
+                (Path(getattr(self.config.outputs, "models_dir", "outputs")) / "hil_measurements").resolve())
         try:
             runtime_device = get_microcontroller_device(
                 self._normalized_device_name(),
@@ -1215,6 +1227,7 @@ class HILServer:
             )
         )
         prepared_dir: Path | None = None
+        metrics = {}
         try:
             prepared_dir = runtime_device.prepare_candidate(
                 request=self._build_candidate_prepare_request(
@@ -1281,7 +1294,31 @@ class HILServer:
                 energy_aware=effective_energy_aware,
             )
         finally:
-            runtime_device.cleanup_prepared_candidate(prepared_dir)
+            active_exception = sys.exc_info()[1]
+            try:
+                if self._normalized_device_name() == STM32_BOARD_NAME:
+                    # Persist request identity outside disposable candidate builds.
+                    records_dir = Path(getattr(self.config.outputs, "models_dir", "outputs")) / "hil_requests"
+                    records_dir.mkdir(parents=True, exist_ok=True)
+                    request_record = records_dir / f"{uuid.uuid4().hex}.json"
+                    metrics["measurement_request_record"] = str(request_record.resolve())
+                    active_exception = sys.exc_info()[1]
+                    with request_record.open("x") as handle:
+                        json.dump({"family_hparams": family_hparams,
+                                   "runtime_metadata": runtime_metadata,
+                                   "quantization_mode": resolved_quantization_mode,
+                                   "device_options": merged_device_options,
+                                   "prepared_dir": str(prepared_dir),
+                                   "exception": None if active_exception is None else str(active_exception),
+                                   "metrics": metrics}, handle, indent=2, default=str)
+            except OSError:
+                logger.exception("Failed to persist STM32 request evidence")
+                # Preserve any active candidate exception. A successful request
+                # must still fail closed if its required evidence cannot be saved.
+                if active_exception is None:
+                    raise
+            finally:
+                runtime_device.cleanup_prepared_candidate(prepared_dir)
 
         metrics["cpu_clock_mhz_requested"] = requested_cpu_clock_mhz
         if self.config.device.hil:
@@ -1305,9 +1342,9 @@ class HILServer:
         Selection depends on ``device.name``, optional Portenta
         ``device.portenta.target_core``, ``training.energy_aware``, and
         ``training.input_mode`` in the loaded config. Uniform sketches use the
-        shared root ``sketches/crest_inference_*.ino`` assets, while
+        shared root ``firmware/crest_inference_*.ino`` assets, while
         dataset-specific representative/real analysis variants continue to use
-        ``sketches/analysis_sketches``.
+        ``firmware/analysis_sketches``.
 
         Returns
         -------

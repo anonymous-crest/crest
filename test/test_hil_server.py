@@ -22,8 +22,8 @@ if str(SRC_DIR) not in sys.path:
 import hil_server as hil_server_module  # noqa: E402
 from hil_server import HILServer  # noqa: E402
 from crest.devices import CandidatePrepareRequest, arduino_staged_sketch_path  # noqa: E402
-from crest.errors import HIL_ERROR_OK  # noqa: E402
-from crest.hil_runtime import CollectMetricsRequest  # noqa: E402
+from crest.errors import HIL_MASTER_SUCCESS, HIL_ERROR_OK  # noqa: E402
+from crest.hil.runtime import CollectMetricsRequest  # noqa: E402
 from crest.pipeline_types import DataSplit, DatasetBundle, TargetSpec, TaskMetricContract  # noqa: E402
 
 
@@ -292,6 +292,8 @@ class HILServerTestCase(unittest.TestCase):
     def setUp(self) -> None:
         # Create a lightweight mock config object to avoid loading YAML files.
         """Prepare test fixtures."""
+        evidence_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(evidence_dir.cleanup)
         self.config = Dict(
             network=SimpleNamespace(host="127.0.0.1", port=6000, recv_timeout_sec=1, send_timeout_sec=1),
             training=Dict(
@@ -306,6 +308,7 @@ class HILServerTestCase(unittest.TestCase):
                 latency_budget_ms=None,
             ),
             outputs=SimpleNamespace(
+                models_dir=Path(evidence_dir.name),
                 tflite_model_path=Path("model.tflite"),
                 candidate_dir=Path("odom_tcn"),
                 checkpoint_path=Path("checkpoint.keras"),
@@ -840,8 +843,9 @@ class DetermineMetricsTests(HILServerTestCase):
         # Cadenced Arduino runs should only schedule the second pass after the base latency pass succeeds, otherwise follow-up telemetry hides the primary failure.
         """Validate determine metrics runs Arduino cadenced second pass after successful base run."""
         server = self.build_server()
-        self.config.device.name = "ARDUINO_NANO_33_BLE_SENSE"
+        self.config.device.name = "PORTENTA_H7"
         self.config.device.runtime_mode = "cadenced"
+        self.config.device.latency_budget_ms = 2000.0
         self.config.training.energy_aware = True
         self.config.training.input_mode = "uniform"
         fake_device = MagicMock()
@@ -860,7 +864,7 @@ class DetermineMetricsTests(HILServerTestCase):
             return_value=fake_device,
         ), patch("hil_server.collect_metrics",
             return_value={
-                "error_code": HIL_ERROR_OK,
+                "error_code": HIL_MASTER_SUCCESS,
                 "arena_bytes": 4096,
                 "runtime_mode": "back_to_back",
                 "cadenced_error_code": -1,
@@ -878,6 +882,7 @@ class DetermineMetricsTests(HILServerTestCase):
         fake_device.set_input_mode.assert_called_once()
         self.assertEqual(fake_device.set_input_mode.call_args.kwargs["runtime_phase"], "cadenced")
         fake_device.evaluate.assert_called_once()
+        self.assertGreaterEqual(fake_device.evaluate.call_args.kwargs["serial_timeout_s"], 25.0)
         self.assertEqual(metrics["runtime_mode"], "cadenced")
         self.assertEqual(metrics["cadenced_error_code"], HIL_ERROR_OK)
         self.assertAlmostEqual(metrics["cadenced_energy_mj_per_window"], 1.5)
@@ -908,7 +913,7 @@ class DetermineMetricsTests(HILServerTestCase):
             return_value=fake_device,
         ), patch("hil_server.collect_metrics",
             return_value={
-                "error_code": HIL_ERROR_OK,
+                "error_code": HIL_MASTER_SUCCESS,
                 "arena_bytes": 4096,
                 "runtime_mode": "back_to_back",
                 "cadenced_error_code": -1,
@@ -1378,6 +1383,8 @@ class InitializationTests(HILServerTestCase):
                 self.request_runtime_metadata(),
             )
 
+        record_path = Path(result.pop("measurement_request_record"))
+        self.assertTrue(record_path.is_file())
         self.assertEqual(result, {"ok": True, "cpu_clock_mhz_requested": -1, "latency_budget_ms": 40.0})
         self.assertEqual(len(FakeModelFamily.materialize_calls), 1)
         fake_device.prepare_candidate.assert_called_once()
@@ -1679,7 +1686,7 @@ class SketchVariantTests(unittest.TestCase):
         """Energy-aware uniform staging should use the generic energy sketch."""
         # Uniform energy runs should pick the energy-enabled sketch variant so the DUT exports the expected telemetry.
         with tempfile.TemporaryDirectory() as tmpdir:
-            sketches = Path(tmpdir) / "sketches"
+            sketches = Path(tmpdir) / "firmware"
             candidate_dir = Path(tmpdir) / "odom_tcn"
             self._write_sketch(sketches / "crest_inference_energy.ino", "uniform_shared")
             server = self._build_server(sketches, candidate_dir, energy_aware=True, input_mode="uniform")
@@ -1693,7 +1700,7 @@ class SketchVariantTests(unittest.TestCase):
     def test_stages_sketch_using_candidate_dir_basename(self) -> None:
         """Arduino sketch staging should preserve the folder/sketch basename rule."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            sketches = Path(tmpdir) / "sketches"
+            sketches = Path(tmpdir) / "firmware"
             candidate_dir = Path(tmpdir) / "audio_dscnn"
             self._write_sketch(sketches / "crest_inference_no_energy.ino", "audio_uniform")
             server = self._build_server(sketches, candidate_dir, energy_aware=False, input_mode="uniform")
@@ -1708,7 +1715,7 @@ class SketchVariantTests(unittest.TestCase):
         """Cadenced staging should use the generic cadenced energy sketch."""
         # Cadenced energy runs must switch to the cadenced uniform sketch so the harness and DUT share the same timing protocol.
         with tempfile.TemporaryDirectory() as tmpdir:
-            sketches = Path(tmpdir) / "sketches"
+            sketches = Path(tmpdir) / "firmware"
             candidate_dir = Path(tmpdir) / "odom_tcn"
             self._write_sketch(sketches / "crest_inference_energy_cadenced.ino", "cadenced_shared")
             server = self._build_server(sketches, candidate_dir, energy_aware=True, input_mode="uniform")
@@ -1722,7 +1729,7 @@ class SketchVariantTests(unittest.TestCase):
         """Portenta CM7 uniform staging should use the generic energy sketch."""
         # Uniform energy runs should pick the energy-enabled sketch variant so the DUT exports the expected telemetry.
         with tempfile.TemporaryDirectory() as tmpdir:
-            sketches = Path(tmpdir) / "sketches"
+            sketches = Path(tmpdir) / "firmware"
             candidate_dir = Path(tmpdir) / "odom_tcn"
             self._write_sketch(sketches / "crest_inference_energy.ino", "uniform_shared_cm7")
             server = self._build_server(
@@ -1743,7 +1750,7 @@ class SketchVariantTests(unittest.TestCase):
         """Portenta CM4 no-energy staging should use the generic no-energy sketch."""
         # Portenta CM4 uniform runs without energy measurement should select the no-energy sketch variant.
         with tempfile.TemporaryDirectory() as tmpdir:
-            sketches = Path(tmpdir) / "sketches"
+            sketches = Path(tmpdir) / "firmware"
             candidate_dir = Path(tmpdir) / "odom_tcn"
             self._write_sketch(sketches / "crest_inference_no_energy.ino", "no_energy_shared_cm4")
             server = self._build_server(
@@ -1764,7 +1771,7 @@ class SketchVariantTests(unittest.TestCase):
         """Representative OxIOD staging should copy the sketch and staged include header."""
         # Representative input-mode runs should switch sketches and copy the generated header that drives the sample payload.
         with tempfile.TemporaryDirectory() as tmpdir:
-            sketches = Path(tmpdir) / "sketches"
+            sketches = Path(tmpdir) / "firmware"
             candidate_dir = Path(tmpdir) / "odom_tcn"
             self._write_sketch(
                 sketches / "analysis_sketches/crest_inference_representative.ino",
@@ -1785,7 +1792,7 @@ class SketchVariantTests(unittest.TestCase):
         """Real-data OxIOD staging should copy the sketch and staged include header."""
         # Real-input runs should stage the real-data sketch and copy the matching generated header.
         with tempfile.TemporaryDirectory() as tmpdir:
-            sketches = Path(tmpdir) / "sketches"
+            sketches = Path(tmpdir) / "firmware"
             candidate_dir = Path(tmpdir) / "odom_tcn"
             self._write_sketch(
                 sketches / "analysis_sketches/crest_inference_real_data.ino",
@@ -1804,7 +1811,7 @@ class SketchVariantTests(unittest.TestCase):
     def test_selects_urbansound8k_variants_and_copies_audio_header(self) -> None:
         """UrbanSound8K modes should stage the shared sketches with the audio header."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            sketches = Path(tmpdir) / "sketches"
+            sketches = Path(tmpdir) / "firmware"
             candidate_dir = Path(tmpdir) / "audio_dscnn"
             self._write_sketch(
                 sketches / "analysis_sketches/crest_inference_representative.ino",
@@ -1835,7 +1842,7 @@ class SketchVariantTests(unittest.TestCase):
         """Dataset representative staging should require its input header."""
         # Representative-mode staging should fail fast if the generated header is missing.
         with tempfile.TemporaryDirectory() as tmpdir:
-            sketches = Path(tmpdir) / "sketches"
+            sketches = Path(tmpdir) / "firmware"
             candidate_dir = Path(tmpdir) / "odom_tcn"
             self._write_sketch(
                 sketches / "analysis_sketches/crest_inference_representative.ino",
@@ -1850,7 +1857,7 @@ class SketchVariantTests(unittest.TestCase):
         # Unknown input modes should fail before sketch selection can stage the wrong artifact.
         """Validate invalid input mode raises."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            sketches = Path(tmpdir) / "sketches"
+            sketches = Path(tmpdir) / "firmware"
             candidate_dir = Path(tmpdir) / "odom_tcn"
             server = self._build_server(sketches, candidate_dir, energy_aware=True, input_mode="bad_mode")
 
@@ -1860,7 +1867,7 @@ class SketchVariantTests(unittest.TestCase):
     def test_old_generic_input_modes_are_unsupported(self) -> None:
         """Old generic representative/real modes should fail through normal validation."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            sketches = Path(tmpdir) / "sketches"
+            sketches = Path(tmpdir) / "firmware"
             candidate_dir = Path(tmpdir) / "odom_tcn"
             for mode in ("representative", "real"):
                 with self.subTest(mode=mode):
@@ -1872,7 +1879,7 @@ class SketchVariantTests(unittest.TestCase):
         """Cadenced Arduino staging should still reject non-uniform inputs."""
         # Cadenced runtime mode should reject non-uniform input modes because the timing harness expects fixed windows.
         with tempfile.TemporaryDirectory() as tmpdir:
-            sketches = Path(tmpdir) / "sketches"
+            sketches = Path(tmpdir) / "firmware"
             candidate_dir = Path(tmpdir) / "odom_tcn"
             self._write_sketch(
                 sketches / "analysis_sketches/crest_inference_representative.ino",
@@ -1889,7 +1896,7 @@ class SketchVariantTests(unittest.TestCase):
         # Uniform Portenta sketch selection needs an explicit target core so the server does not guess between CM4 and CM7.
         """Validate Portenta uniform requires target core."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            sketches = Path(tmpdir) / "sketches"
+            sketches = Path(tmpdir) / "firmware"
             candidate_dir = Path(tmpdir) / "odom_tcn"
             server = self._build_server(
                 sketches,
@@ -1907,7 +1914,7 @@ class SketchVariantTests(unittest.TestCase):
         """No-energy uniform staging should use the generic no-energy sketch."""
         # Turning off energy awareness should switch to the no-energy sketch variant to avoid unnecessary harness instrumentation.
         with tempfile.TemporaryDirectory() as tmpdir:
-            sketches = Path(tmpdir) / "sketches"
+            sketches = Path(tmpdir) / "firmware"
             candidate_dir = Path(tmpdir) / "odom_tcn"
             self._write_sketch(sketches / "crest_inference_no_energy.ino", "no_energy_shared")
             server = self._build_server(sketches, candidate_dir, energy_aware=False, input_mode="uniform")
@@ -1921,7 +1928,7 @@ class SketchVariantTests(unittest.TestCase):
         """Input-mode updates should stage the renamed generic energy sketch."""
         # Input-mode switching should update both the active config and the selected sketch path together.
         with tempfile.TemporaryDirectory() as tmpdir:
-            sketches = Path(tmpdir) / "sketches"
+            sketches = Path(tmpdir) / "firmware"
             candidate_dir = Path(tmpdir) / "odom_tcn"
             self._write_sketch(sketches / "crest_inference_energy.ino", "uniform_shared")
             server = self._build_server(sketches, candidate_dir, energy_aware=True, input_mode="uniform")
@@ -1934,3 +1941,20 @@ class SketchVariantTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class EvidenceFailureTests(HILServerTestCase):
+    def test_request_archive_failure_preserves_candidate_exception_and_cleanup(self):
+        """Archive failure must preserve the candidate exception and release request resources."""
+        self.config.device.name = 'STM32_NUCLEO_N657X0_Q'
+        server = self.build_server()
+        device = MagicMock()
+        device.requires_candidate_model.return_value = False
+        device.prepare_candidate.return_value = Path('unused')
+        with patch('hil_server.get_microcontroller_device', return_value=device), \
+             patch('hil_server.resolve_device_options', return_value={}), \
+             patch('hil_server.collect_metrics', side_effect=ValueError('original candidate error')), \
+             patch('hil_server.Path.open', side_effect=OSError('disk full')):
+            with self.assertRaisesRegex(ValueError, 'original candidate error'):
+                server.determine_metrics(self.request_family_hparams(), self.request_runtime_metadata())
+        device.cleanup_prepared_candidate.assert_called_once_with(Path('unused'))

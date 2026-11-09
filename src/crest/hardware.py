@@ -11,6 +11,7 @@ device classes is in progress.
 from __future__ import annotations
 
 import os
+import json
 import shutil
 import sys
 from pathlib import Path
@@ -31,7 +32,7 @@ import subprocess
 import time
 import tempfile
 
-from .devices import DeviceInterface, DEVICE_SPECS  # legacy catalog moved to devices.py (Phase 1 bridge)
+from .devices import DeviceInterface, DEVICE_SPECS, get_device_spec  # legacy catalog moved to devices.py (Phase 1 bridge)
 from .errors import (
     HIL_ERROR_OK,
     HIL_ERROR_COMPILE,
@@ -40,6 +41,7 @@ from .errors import (
     HIL_ERROR_FLASH_OVERFLOW,
     HIL_ERROR_RAM_OVERFLOW,
     HIL_ERROR_UPLOAD,
+    HIL_ERROR_INTEGRITY,
     HIL_MASTER_PENDING,
     HIL_MASTER_SUCCESS,
     HIL_MASTER_ARENA_EXHAUSTED,
@@ -47,6 +49,7 @@ from .errors import (
     HIL_MASTER_FLASH_OVERFLOW,
     HIL_MASTER_RAM_OVERFLOW,
     HIL_MASTER_DEVICE_NOT_FOUND,
+    HIL_MASTER_INFRASTRUCTURE,
 )
 from .microcontrollers.arduino_base import normalize_power_metrics
 from .microcontrollers import get_device as get_microcontroller_device
@@ -421,8 +424,13 @@ def _ordered_tflite_output_details(interpreter: tf.lite.Interpreter) -> list[dic
 def predict_tflite_model(
     tflite_path: Union[str, Path],
     inputs,
+    *,
+    diagnostics: dict | None = None,
 ) -> np.ndarray | list[np.ndarray]:
     """Run host-side TFLite inference over a split input batch.
+
+    XNNPACK runtime failures are retried once using built-in kernels on the
+    same model. The entire split is rerun, never mixed with partial results.
 
     Parameters
     ----------
@@ -430,6 +438,8 @@ def predict_tflite_model(
         TFLite flatbuffer path.
     inputs : array-like
         Split inputs with a leading sample dimension.
+    diagnostics : dict, optional
+        Populated with the interpreter policy and any XNNPACK fallback reason.
 
     Returns
     -------
@@ -443,10 +453,49 @@ def predict_tflite_model(
     ValueError
         If existing validation or execution checks fail.
     """
+    evidence = diagnostics if diagnostics is not None else {}
+    evidence.pop("fallback_reason", None)
+    evidence.update(backend="default", tensorflow_version=tf.__version__)
+    try:
+        return _predict_tflite_model(tflite_path, inputs)
+    except RuntimeError as exc:
+        # A delegate limitation is not proof that the quantized model is invalid.
+        # Retry the entire split with a fresh interpreter; never mix predictions.
+        # Other runtime errors may indicate a broken model or input contract;
+        # changing kernels must not hide those failures.
+        if "xnnpack" not in str(exc).lower():
+            raise
+        evidence.update(backend="builtin_without_default_delegates", fallback_reason=str(exc))
+        logger.warning("XNNPACK failed for %s; retrying with TFLite built-in kernels: %s", tflite_path, exc)
+        return _predict_tflite_model(tflite_path, inputs, disable_default_delegates=True)
+
+
+def _predict_tflite_model(tflite_path, inputs, *, disable_default_delegates=False):
+    """Evaluate a whole split with one interpreter policy.
+
+    Parameters
+    ----------
+    tflite_path : str or pathlib.Path
+        Unmodified quantized or float model artifact.
+    inputs : array-like
+        Split inputs with a leading sample dimension.
+    disable_default_delegates : bool, optional
+        Use TFLite built-in kernels without XNNPACK when true.
+
+    Returns
+    -------
+    numpy.ndarray or list[numpy.ndarray]
+        Predictions in model signature order.
+    """
     data = np.asarray(inputs, dtype=np.float32)
     if data.ndim < 1:
         raise ValueError("TFLite evaluation inputs must include a sample dimension.")
-    interpreter = tf.lite.Interpreter(model_path=str(tflite_path))
+    options = {}
+    if disable_default_delegates:
+        # Disable automatic delegates only for host prediction. The flatbuffer
+        # sent to the device is unchanged, so deployment remains comparable.
+        options["experimental_op_resolver_type"] = tf.lite.experimental.OpResolverType.BUILTIN_WITHOUT_DEFAULT_DELEGATES
+    interpreter = tf.lite.Interpreter(model_path=str(tflite_path), **options)
     input_details = interpreter.get_input_details()
     output_details = interpreter.get_output_details()
     if len(input_details) != 1:
@@ -481,6 +530,8 @@ def predict_tflite_model_subprocess(
     tflite_path: Union[str, Path],
     inputs,
     timeout_sec: float = 900.0,
+    *,
+    diagnostics: dict | None = None,
 ) -> np.ndarray | list[np.ndarray]:
     """Run host-side TFLite inference in an isolated Python subprocess.
 
@@ -492,6 +543,8 @@ def predict_tflite_model_subprocess(
         Split inputs with a leading sample dimension.
     timeout_sec : float, optional
         Maximum number of seconds to wait for the worker process.
+    diagnostics : dict, optional
+        Populated with worker interpreter policy and fallback evidence.
 
     Returns
     -------
@@ -554,6 +607,13 @@ def predict_tflite_model_subprocess(
 
         try:
             with np.load(outputs_path, allow_pickle=False) as output_archive:
+                # The isolated worker owns the interpreter. Carry its policy and
+                # fallback reason back with the predictions for caller diagnostics.
+                evidence = json.loads(str(output_archive["diagnostics"].item())) if "diagnostics" in output_archive else {}
+                if diagnostics is not None:
+                    diagnostics.update(evidence)
+                if evidence.get("fallback_reason"):
+                    logger.warning("TFLite evaluation used built-in kernels for %s after XNNPACK failure: %s", model_path, evidence["fallback_reason"])
                 num_outputs = int(np.asarray(output_archive["num_outputs"]).item())
                 if num_outputs < 1:
                     raise ValueError("TFLite worker wrote no outputs.")
@@ -826,12 +886,11 @@ def return_hardware_specs(
             device_options=device_options,
         ).spec
         return int(spec.max_ram_bytes), int(spec.max_flash_bytes)
-    try:
-        spec = DEVICE_SPECS[normalized_name]
-    except KeyError as exc:
-        raise ValueError(
-            f"Unknown device '{normalized_name}'. Supported devices: {list(DEVICE_SPECS)}"
-        ) from exc
+    if normalized_name not in DEVICE_SPECS:
+        # Direct backend imports can defer registry population during a cycle.
+        # Reuse the catalog's lazy refresh, preserving custom/legacy entries.
+        get_device_spec(normalized_name)
+    spec = DEVICE_SPECS[normalized_name]
     return int(spec["max_ram"]), int(spec["max_flash"])
 
 
@@ -952,12 +1011,11 @@ def arena_size_candidates(
             device_options=device_options,
         ).spec
         return np.array([int(value) for value in spec.arena_sizes_kb])
-    try:
-        spec = DEVICE_SPECS[normalized_name]
-    except KeyError as exc:
-        raise ValueError(
-            f"Unknown device '{normalized_name}'. Supported devices: {list(DEVICE_SPECS)}"
-        ) from exc
+    if normalized_name not in DEVICE_SPECS:
+        # Direct backend imports can defer registry population during a cycle.
+        # Reuse the catalog's lazy refresh, preserving custom/legacy entries.
+        get_device_spec(normalized_name)
+    spec = DEVICE_SPECS[normalized_name]
     return np.array(spec["arena_sizes"])
 
 
@@ -972,6 +1030,7 @@ _HIL_ERROR_LABELS = {
     HIL_ERROR_FLASH_OVERFLOW: "HIL_ERROR_FLASH_OVERFLOW",
     HIL_ERROR_RAM_OVERFLOW: "HIL_ERROR_RAM_OVERFLOW",
     HIL_ERROR_UPLOAD: "HIL_ERROR_UPLOAD",
+    HIL_ERROR_INTEGRITY: "HIL_ERROR_INTEGRITY",
 }
 
 _HIL_MASTER_ERROR_LABELS = {
@@ -982,6 +1041,7 @@ _HIL_MASTER_ERROR_LABELS = {
     HIL_MASTER_FLASH_OVERFLOW: "HIL_MASTER_FLASH_OVERFLOW",
     HIL_MASTER_RAM_OVERFLOW: "HIL_MASTER_RAM_OVERFLOW",
     HIL_MASTER_DEVICE_NOT_FOUND: "HIL_MASTER_DEVICE_NOT_FOUND",
+    HIL_MASTER_INFRASTRUCTURE: "HIL_MASTER_INFRASTRUCTURE",
 }
 
 
@@ -1498,6 +1558,11 @@ def HIL_controller(
             idealArenaBytes = arena_bytes
             finPower_metrics = power_metrics
             masterError = HIL_MASTER_FLASH_OVERFLOW
+        elif err_flag == HIL_ERROR_INTEGRITY:
+            finRAM, finFlash, finLatency = ram_bytes, flash_bytes, latency_s
+            idealArenaBytes, finPower_metrics = arena_bytes, power_metrics
+            masterError = HIL_MASTER_INFRASTRUCTURE
+            break
         elif err_flag == HIL_ERROR_UPLOAD:
             # Upload failures usually mean the board disappeared; stop the sweep immediately.
             finRAM = ram_bytes

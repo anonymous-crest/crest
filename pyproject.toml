@@ -23,10 +23,12 @@ dependencies = [
     "keras-tcn",
     "scikit-learn",
     "pandas",
+    "matplotlib",
     "numpy-quaternion",
     "giotto-tda",
     "pydometer",
     "tqdm",
+    "pydantic>=2,<3",
     "soundata==1.0.1",
     "librosa==0.11.0",
     "soundfile==0.13.1"
@@ -34,3 +36,10 @@ dependencies = [
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+# Test this checkout instead of unrelated installs, without a manual PYTHONPATH.
+pythonpath = ["src"]
+
+[tool.setuptools.package-data]
+"crest.optimizers.llm.providers" = ["pricing.json"]

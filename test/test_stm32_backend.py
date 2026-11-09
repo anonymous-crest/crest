@@ -20,6 +20,7 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from crest.errors import (  # noqa: E402
+    HIL_ERROR_INTEGRITY,
     HIL_ERROR_COMPILE,
     HIL_ERROR_FLASH_OVERFLOW,
     HIL_ERROR_LATENCY,
@@ -34,6 +35,7 @@ from crest.microcontrollers import stm32_nucleo_n657x0 as stm32_n657_backend  # 
 from crest.microcontrollers import stm32_runtime  # noqa: E402
 from crest.microcontrollers.stm32_nucleo_n657x0 import (  # noqa: E402
     BOARD_NAME,
+    MEASUREMENT_INTEGRITY_KINDS,
     DEFAULT_WEIGHTS_EXTERNAL_LOADER_NAME,
     DEFAULT_MAX_EXTERNAL_FLASH_BYTES,
     DEFAULT_TEMPLATE_ROOT,
@@ -348,6 +350,11 @@ class STM32RegistryTests(unittest.TestCase):
 class STM32BackendBehaviorTests(unittest.TestCase):
     """Validate STM Phase 2 option resolution, staging, and compile behavior."""
 
+    def setUp(self) -> None:
+        """Keep durable measurement records inside a per-test temporary directory."""
+        evidence_dir = self.enterContext(tempfile.TemporaryDirectory())
+        self.enterContext(patch("crest.microcontrollers.stm32_nucleo_n657x0.Path.cwd", return_value=Path(evidence_dir)))
+
     def test_resolve_device_options_defaults_partial_stm_numeric_block(self) -> None:
         """Ensure partial STM config blocks inherit defaults from the backend.
 
@@ -603,6 +610,13 @@ class STM32BackendBehaviorTests(unittest.TestCase):
             serial_log=["STM32_AI_INIT=OK", "DUT READY", "STM32_AI_RUN=OK"],
             power_metrics={"clock_hz": 600000000.0, "sequence": 1.0},
         )
+        # Repaired DUT telemetry: RTC aggregate covers all reported releases.
+        telemetry.serial_log.extend([
+            "measurement protocol output: rtc_wall_v5_dwt_active_stop_evidence_all_slots",
+            "cadence budget (ms): 200",
+        ])
+        telemetry.power_metrics.update(runs=10, phase="back_to_back",
+            timer_per_window_s=0.025, rtc_clock_source="LSE", rtc_clock_hz_nominal=32768)
 
         with patch.object(device, "compile", return_value=compile_result), patch(
             "crest.microcontrollers.stm32_nucleo_n657x0.stm32_cube_clt.resolve_elf_path",
@@ -680,7 +694,7 @@ class STM32BackendBehaviorTests(unittest.TestCase):
             latency_s=0.0025,
             arena_bytes=4096,
             error_code=HIL_ERROR_OK,
-            power_metrics={"clock_hz": 600000000.0, "sequence": 1.0},
+            power_metrics={"clock_hz": 600000000.0, "sequence": 1.0, "energy_mj_per_inference": 0.25},
         )
         cadenced_result = DeviceMetrics(
             ram_bytes=1111,
@@ -732,6 +746,8 @@ class STM32BackendBehaviorTests(unittest.TestCase):
         self.assertAlmostEqual(metrics.latency_s, 0.080)
         self.assertAlmostEqual(metrics.power_metrics["cadenced_active_inference_latency_ms"], 80.0)
         self.assertAlmostEqual(metrics.power_metrics["cadenced_window_latency_ms"], 20000.0)
+        # Scoring retains base energy even when cadence telemetry is also available.
+        self.assertAlmostEqual(metrics.power_metrics["energy_mj_per_inference"], 0.25)
         self.assertAlmostEqual(metrics.power_metrics["cadenced_energy_mj_per_window"], 1.25)
         self.assertAlmostEqual(metrics.power_metrics["cadenced_energy_mj_per_trial"], 12.5)
         self.assertAlmostEqual(metrics.power_metrics["cadenced_rtc_sleep_ms"], 1500.0)
@@ -1237,6 +1253,11 @@ class STM32BackendBehaviorTests(unittest.TestCase):
 class STM32HelperTests(unittest.TestCase):
     """Validate lower-level STM32 helper behavior."""
 
+    def setUp(self) -> None:
+        """Keep durable measurement records inside a per-test temporary directory."""
+        evidence_dir = self.enterContext(tempfile.TemporaryDirectory())
+        self.enterContext(patch("crest.microcontrollers.stm32_nucleo_n657x0.Path.cwd", return_value=Path(evidence_dir)))
+
     def test_resolve_weights_external_loader_autodiscovers_from_cubeprog_bin(self) -> None:
         """Ensure the backend finds the shipped Nucleo loader without a user path.
 
@@ -1533,12 +1554,21 @@ class STM32HelperTests(unittest.TestCase):
                     "wake_overshoot_us": 35.0,
                     "rtc_sleep_total_ms": 1500.0,
                     "deadline_miss_count": 2,
+                    "slept_slots": 4,
+                    "stop_entries": 4,
                     "rtc_clock_hz_nominal": 32768.0,
                     "rtc_clock_source": "LSE",
                     "cadence_timing_quality": "crystal",
                     "stop_mode_variant": "system_stop_mainreg_wfi",
                 },
             )
+            # Repaired DUT telemetry: RTC aggregate covers all reported releases.
+            telemetry.serial_log.extend([
+                "measurement protocol output: rtc_wall_v5_dwt_active_stop_evidence_all_slots",
+                "cadence budget (ms): 200",
+            ])
+            telemetry.power_metrics.update(runs=5, phase="back_to_back",
+                timer_per_window_s=0.015, rtc_clock_source="LSE", rtc_clock_hz_nominal=32768)
             trace: list[str] = []
 
             class _TracingMonitor(_FakeSerialMonitor):
@@ -1708,11 +1738,13 @@ class STM32HelperTests(unittest.TestCase):
             self.assertEqual(metrics.power_metrics["runs"], 5)
             self.assertEqual(metrics.power_metrics["timer_output_s"], 0.015)
             self.assertEqual(metrics.power_metrics["timer_per_inference_s"], 0.003)
-            self.assertEqual(metrics.power_metrics["timer_per_window_s"], 0.003)
+            self.assertEqual(metrics.power_metrics["timer_per_window_s"], 0.015)
             self.assertEqual(metrics.power_metrics["wake_recovery_us"], 1200.0)
             self.assertEqual(metrics.power_metrics["wake_overshoot_us"], 35.0)
             self.assertEqual(metrics.power_metrics["rtc_sleep_total_ms"], 1500.0)
             self.assertEqual(metrics.power_metrics["deadline_miss_count"], 2)
+            self.assertEqual(metrics.power_metrics["slept_slots"], 4)
+            self.assertEqual(metrics.power_metrics["stop_entries"], 4)
             self.assertEqual(metrics.power_metrics["rtc_clock_hz_nominal"], 32768.0)
             self.assertEqual(metrics.power_metrics["rtc_clock_source"], "LSE")
             self.assertEqual(metrics.power_metrics["cadence_timing_quality"], "crystal")
@@ -1721,7 +1753,7 @@ class STM32HelperTests(unittest.TestCase):
                 "system_stop_mainreg_wfi",
             )
 
-    def test_evaluate_harness_ready_timeout_maps_to_latency_error(self) -> None:
+    def test_evaluate_harness_ready_timeout_maps_to_integrity_error(self) -> None:
         """Ensure missing HARNESS READY becomes a stable latency failure.
 
         Returns
@@ -1788,10 +1820,10 @@ class STM32HelperTests(unittest.TestCase):
                     harness_serial_port="/dev/ttyACM1",
                 )
 
-            self.assertEqual(metrics.error_code, HIL_ERROR_LATENCY)
+            self.assertEqual(metrics.error_code, HIL_ERROR_INTEGRITY)
             self.assertEqual(metrics.power_metrics["backend_error_kind"], "harness_ready_timeout")
 
-    def test_evaluate_harness_done_timeout_maps_to_latency_error(self) -> None:
+    def test_evaluate_harness_done_timeout_maps_to_integrity_error(self) -> None:
         """Ensure missing harness DONE becomes a stable latency failure.
 
         Returns
@@ -1886,7 +1918,7 @@ class STM32HelperTests(unittest.TestCase):
                     harness_serial_port="/dev/ttyACM1",
                 )
 
-            self.assertEqual(metrics.error_code, HIL_ERROR_LATENCY)
+            self.assertEqual(metrics.error_code, HIL_ERROR_INTEGRITY)
             self.assertEqual(metrics.power_metrics["backend_error_kind"], "harness_done_timeout")
 
     def test_compile_external_flash_overflow_maps_to_flash_failure(self) -> None:
@@ -2649,9 +2681,37 @@ class STM32HelperTests(unittest.TestCase):
             with self.assertRaises(stm32_cube_clt.WorkflowError):
                 device._read_storage_manifest(staged_root)
 
-    def test_program_runtime_images_skips_reprogramming_when_artifacts_are_unchanged(self) -> None:
-        """Ensure repeated LRUN upload skips unchanged signed-app and weight programming."""
-        # Runtime programming should skip unchanged artifacts so repeated evaluations do not waste flash cycles.
+    def test_external_programming_verifies_both_app_and_weights(self) -> None:
+        """App and weight writes must request verification and propagate failures."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            directory = Path(tmpdir)
+            image = directory / "payload.bin"
+            loader = directory / "flash.stldr"
+            programmer = directory / "STM32_Programmer_CLI"
+            for path in (image, loader, programmer):
+                path.write_bytes(b"fixture")
+            programmer.chmod(0o755)
+            for weights in (False, True):
+                with self.subTest(weights=weights):
+                    kwargs = dict(cubeprog_bin=directory, apid=1, external_loader=loader, recover_first=False)
+                    if weights:
+                        function = stm32_cube_clt.program_external_flash_blob
+                        kwargs.update(weights_blob_path=image, weights_flash_address="0x71000000")
+                    else:
+                        function = stm32_cube_clt.program_external_image
+                        kwargs.update(image_path=image, flash_address="0x70100000")
+                    with patch.object(stm32_cube_clt, "_run_command", return_value="verified") as command:
+                        self.assertEqual(function(**kwargs), "verified")
+                    argv = command.call_args.args[0]
+                    self.assertIn("-v", argv)
+                    self.assertEqual(argv[argv.index("-d") + 1], str(image.resolve()))
+                    with patch.object(stm32_cube_clt, "_run_command", side_effect=stm32_cube_clt.WorkflowError("verification failed")):
+                        with self.assertRaisesRegex(stm32_cube_clt.WorkflowError, "verification failed"):
+                            function(**kwargs)
+
+    def test_program_runtime_images_reprograms_shared_board_despite_workspace_history(self) -> None:
+        """Revisiting a workspace must restore its app and weights on a shared board."""
+        # Another workspace may have replaced both images since the previous upload.
         with tempfile.TemporaryDirectory() as tmpdir:
             staged_root = _build_lrun_project_tree(Path(tmpdir) / "staged")
             signed_app = staged_root / "STM32CubeIDE" / "AppS" / "Debug" / "Template_LRUN_AppS-trusted.bin"
@@ -2717,19 +2777,33 @@ class STM32HelperTests(unittest.TestCase):
 
             with patch(
                 "crest.microcontrollers.stm32_nucleo_n657x0.stm32_cube_clt.program_external_image",
-                side_effect=AssertionError("signed app should not be reprogrammed"),
+                return_value="app reprogrammed",
             ), patch(
                 "crest.microcontrollers.stm32_nucleo_n657x0.stm32_cube_clt.program_external_flash_blob",
-                side_effect=AssertionError("weights should not be reprogrammed"),
+                return_value="weights reprogrammed",
             ):
                 second = device._program_runtime_images(paths, compile_result=compile_result)
 
-            self.assertFalse(second["appli_programmed"])
-            self.assertFalse(second["weights_programmed"])
+            self.assertTrue(second["appli_programmed"])
+            self.assertTrue(second["weights_programmed"])
+            signed_app.write_bytes(b"changed-signed-app")
+            weights_blob.write_bytes(b"changed-weights")
+            with patch(
+                "crest.microcontrollers.stm32_nucleo_n657x0.stm32_cube_clt.program_external_image",
+                return_value="app verified",
+            ), patch(
+                "crest.microcontrollers.stm32_nucleo_n657x0.stm32_cube_clt.program_external_flash_blob",
+                return_value="weights verified",
+            ):
+                device._program_runtime_images(paths, compile_result=compile_result)
+            updated = json.loads(manifest_path.read_text())
+            self.assertEqual(updated["last_programmed_appli_sha256"], stm32_n657_backend._sha256_file(signed_app))
+            self.assertEqual(updated["last_programmed_weights_sha256"], stm32_n657_backend._sha256_file(weights_blob))
+            self.assertEqual(updated["weights_blob_size"], weights_blob.stat().st_size)
 
-    def test_program_runtime_images_skip_path_does_not_resolve_loader(self) -> None:
-        """Ensure repeated LRUN uploads do not require loader resolution on no-op skips."""
-        # The programming skip path should not resolve a loader that it never intends to use.
+    def test_program_runtime_images_stale_workspace_cache_still_requires_loader(self) -> None:
+        """Cached workspace digests cannot bypass loader validation or programming."""
+        # A stale workspace history must not bypass a missing programming prerequisite.
         with tempfile.TemporaryDirectory() as tmpdir:
             staged_root = _build_lrun_project_tree(Path(tmpdir) / "staged")
             signed_app = staged_root / "STM32CubeIDE" / "AppS" / "Debug" / "Template_LRUN_AppS-trusted.bin"
@@ -2781,12 +2855,11 @@ class STM32HelperTests(unittest.TestCase):
 
             with patch(
                 "crest.microcontrollers.stm32_nucleo_n657x0._resolve_weights_external_loader",
-                side_effect=AssertionError("loader resolution should be skipped"),
-            ):
-                metrics = device._program_runtime_images(paths, compile_result=compile_result)
-
-            self.assertFalse(metrics["appli_programmed"])
-            self.assertFalse(metrics["weights_programmed"])
+                side_effect=stm32_cube_clt.WorkflowError("missing loader"),
+            ) as resolve_loader:
+                with self.assertRaisesRegex(stm32_cube_clt.WorkflowError, "missing loader"):
+                    device._program_runtime_images(paths, compile_result=compile_result)
+            resolve_loader.assert_called_once()
 
     def test_program_runtime_images_uses_manifest_loader_for_signed_app_programming(self) -> None:
         """Ensure signed-App programming honors the loader path staged in the manifest."""
@@ -2902,6 +2975,13 @@ class STM32HelperTests(unittest.TestCase):
                 serial_log=["STM32_AI_INIT=OK", "DUT READY", "STM32_AI_RUN=OK"],
                 power_metrics={"clock_hz": 600000000.0, "sequence": 1.0, "runs": 1, "phase": "back_to_back"},
             )
+            # Repaired DUT telemetry: RTC aggregate covers all reported releases.
+            telemetry.serial_log.extend([
+                "measurement protocol output: rtc_wall_v5_dwt_active_stop_evidence_all_slots",
+                "cadence budget (ms): 200",
+            ])
+            telemetry.power_metrics.update(runs=10, phase="back_to_back",
+                timer_per_window_s=0.03, rtc_clock_source="LSE", rtc_clock_hz_nominal=32768)
             trace: list[str] = []
 
             with patch.object(device, "compile", return_value=compile_result), patch(
@@ -3025,6 +3105,13 @@ class STM32HelperTests(unittest.TestCase):
                 serial_log=["STM32_AI_INIT=OK", "DUT READY", "STM32_AI_RUN=OK"],
                 power_metrics={"clock_hz": 600000000.0, "sequence": 1.0, "runs": 1, "phase": "back_to_back"},
             )
+            # Repaired DUT telemetry: RTC aggregate covers all reported releases.
+            telemetry.serial_log.extend([
+                "measurement protocol output: rtc_wall_v5_dwt_active_stop_evidence_all_slots",
+                "cadence budget (ms): 200",
+            ])
+            telemetry.power_metrics.update(runs=1, phase="back_to_back",
+                timer_per_window_s=0.003, rtc_clock_source="LSE", rtc_clock_hz_nominal=32768)
             observed: dict[str, float] = {}
 
             def _runtime_session(*args, **kwargs):
@@ -3124,6 +3211,13 @@ class STM32HelperTests(unittest.TestCase):
                     "phase": "back_to_back",
                 },
             )
+            # Repaired DUT telemetry: RTC aggregate covers all reported releases.
+            telemetry.serial_log.extend([
+                "measurement protocol output: rtc_wall_v5_dwt_active_stop_evidence_all_slots",
+                "cadence budget (ms): 200",
+            ])
+            telemetry.power_metrics.update(runs=7, phase="back_to_back",
+                timer_per_window_s=0.021, rtc_clock_source="LSE", rtc_clock_hz_nominal=32768)
 
             with patch.object(device, "compile", return_value=compile_result), patch.object(
                 device,
@@ -3257,6 +3351,13 @@ class STM32HelperTests(unittest.TestCase):
                     "phase": "back_to_back",
                 },
             )
+            # Repaired DUT telemetry: RTC aggregate covers all reported releases.
+            telemetry.serial_log.extend([
+                "measurement protocol output: rtc_wall_v5_dwt_active_stop_evidence_all_slots",
+                "cadence budget (ms): 200",
+            ])
+            telemetry.power_metrics.update(runs=4, phase="back_to_back",
+                timer_per_window_s=0.012, rtc_clock_source="LSE", rtc_clock_hz_nominal=32768)
 
             with patch.object(device, "compile", return_value=compile_result), patch.object(
                 device,
@@ -3402,6 +3503,13 @@ class STM32HelperTests(unittest.TestCase):
                     "phase": "back_to_back",
                 },
             )
+            # Repaired DUT telemetry: RTC aggregate covers all reported releases.
+            telemetry.serial_log.extend([
+                "measurement protocol output: rtc_wall_v5_dwt_active_stop_evidence_all_slots",
+                "cadence budget (ms): 321",
+            ])
+            telemetry.power_metrics.update(runs=4, phase="back_to_back",
+                timer_per_window_s=0.012, rtc_clock_source="LSE", rtc_clock_hz_nominal=32768)
 
             with patch.object(device, "compile", return_value=compile_result), patch.object(
                 device,
@@ -3521,6 +3629,13 @@ class STM32HelperTests(unittest.TestCase):
                     "phase": "back_to_back",
                 },
             )
+            # Repaired DUT telemetry: RTC aggregate covers all reported releases.
+            telemetry.serial_log.extend([
+                "measurement protocol output: rtc_wall_v5_dwt_active_stop_evidence_all_slots",
+                "cadence budget (ms): 200",
+            ])
+            telemetry.power_metrics.update(runs=10, phase="back_to_back",
+                timer_per_window_s=0.03, rtc_clock_source="LSE", rtc_clock_hz_nominal=32768)
 
             with patch.object(device, "compile", return_value=compile_result), patch.object(
                 device,
@@ -3590,10 +3705,10 @@ class STM32HelperTests(unittest.TestCase):
         """Ensure the checked-in canonical LRUN linkers reserve safe heap/stack floors."""
         # Canonical LRUN linker templates should keep the checked-in minimum heap and stack floors.
         app_reservations = stm32_n657_backend._parse_linker_reservations(
-            ROOT_DIR / "sketches" / "stm32" / "crest_stm32_lrun" / "STM32CubeIDE" / "AppS" / "STM32N657XX_LRUN.ld"
+            ROOT_DIR / "firmware" / "stm32" / "crest_stm32_lrun" / "STM32CubeIDE" / "AppS" / "STM32N657XX_LRUN.ld"
         )
         boot_reservations = stm32_n657_backend._parse_linker_reservations(
-            ROOT_DIR / "sketches" / "stm32" / "crest_stm32_lrun" / "STM32CubeIDE" / "Boot" / "STM32N657XX_AXISRAM2_fsbl.ld"
+            ROOT_DIR / "firmware" / "stm32" / "crest_stm32_lrun" / "STM32CubeIDE" / "Boot" / "STM32N657XX_AXISRAM2_fsbl.ld"
         )
         self.assertEqual(app_reservations["heap_bytes"], 0x2000)
         self.assertEqual(app_reservations["stack_bytes"], 0x4000)
@@ -3603,7 +3718,7 @@ class STM32HelperTests(unittest.TestCase):
     def test_real_lrun_template_parsers_match_checked_in_files(self) -> None:
         """Ensure LRUN path resolution and parser expectations match the checked-in workspace."""
         # Template parsers should still match the checked-in LRUN files shipped with the repository.
-        canonical_root = ROOT_DIR / "sketches" / "stm32" / "crest_stm32_lrun"
+        canonical_root = ROOT_DIR / "firmware" / "stm32" / "crest_stm32_lrun"
         with tempfile.TemporaryDirectory() as tmpdir:
             staged_root = Path(tmpdir) / canonical_root.name
             shutil.copytree(canonical_root, staged_root)
@@ -3639,7 +3754,7 @@ class STM32HelperTests(unittest.TestCase):
         # The canonical LRUN app recipe should keep the secure NSC region enabled.
         recipe = (
             ROOT_DIR
-            / "sketches"
+            / "firmware"
             / "stm32"
             / "crest_stm32_lrun"
             / "STM32CubeIDE"
@@ -3656,7 +3771,7 @@ class STM32HelperTests(unittest.TestCase):
         # The canonical LRUN XSPI2 IRQ hook should keep using the second HAL handle.
         irq_text = (
             ROOT_DIR
-            / "sketches"
+            / "firmware"
             / "stm32"
             / "crest_stm32_lrun"
             / "Appli"
@@ -3671,7 +3786,7 @@ class STM32HelperTests(unittest.TestCase):
         # The canonical LRUN runner should fail cadenced init when the RTC self-test fails.
         runner_text = (
             ROOT_DIR
-            / "sketches"
+            / "firmware"
             / "stm32"
             / "crest_stm32_lrun"
             / "Appli"
@@ -3749,3 +3864,88 @@ class STM32HelperTests(unittest.TestCase):
             ):
                 with self.assertRaises(stm32_cube_clt.WorkflowError):
                     stm32_cube_clt.parse_size_output(elf_path)
+
+
+class RuntimeIOEvidenceTests(unittest.TestCase):
+    def test_partial_dut_log_survives_transport_failure_and_retry(self):
+        """Partial DUT output must survive transport recovery in durable evidence."""
+        from types import SimpleNamespace
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            device = STM32NucleoN657X0QDevice(
+                device_options={"measurement_records_dir": root / "records"})
+            compiled = SimpleNamespace(success=True, log="ok", flash_bytes=2,
+                ram_bytes=1, overflow_kind=None, build_dir=root / "Debug", arena_bytes=3)
+            prefix = "crest.microcontrollers.stm32_nucleo_n657x0."
+            with patch.object(device, "compile", return_value=compiled) as compile_mock, \
+                 patch(prefix + "stm32_cube_clt.resolve_elf_path", return_value=root / "app.elf"), \
+                 patch(prefix + "stm32_runtime.SerialMonitor") as monitor_class, \
+                 patch(prefix + "stm32_cube_clt.debug_load_elf", return_value="ok"), \
+                 patch(prefix + "stm32_runtime.execute_runtime_session",
+                       side_effect=RuntimeError("serial reader failed")):
+                monitor_class.return_value.__enter__.return_value.snapshot_lines.return_value = [
+                    "STM32_AI_INIT=OK", "DUT READY"]
+                result = device.evaluate(dirpath=root / "unstaged", arena_kb=-1,
+                    window_size=200, num_channels=10, serial_port="fake")
+            self.assertEqual(result.error_code, HIL_ERROR_INTEGRITY)
+            # An integrity retry reuses its build without retaining hidden device state.
+            self.assertEqual(compile_mock.call_count, 1)
+            self.assertFalse(hasattr(device, "_phase_compile_result"))
+            paths = result.power_metrics["measurement_record_paths"]
+            self.assertEqual(len(paths), 2)
+            for path in paths:
+                record = json.loads(Path(path).read_text())
+                self.assertEqual(record["dut_log"], ["STM32_AI_INIT=OK", "DUT READY"])
+                self.assertEqual(record["result"]["power_metrics"]["backend_error_kind"], "runtime_io")
+
+
+class MeasurementRetryPolicyTests(unittest.TestCase):
+    def test_retry_compile_state_is_local_to_each_phase(self):
+        # A later phase that fails before compiling must not reuse an earlier build.
+        device = STM32NucleoN657X0QDevice()
+        compiled = object()
+        failure = DeviceMetrics(ram_bytes=1, flash_bytes=2, latency_s=-1.0,
+                                arena_bytes=3, error_code=HIL_ERROR_INTEGRITY)
+        states = []
+
+        def attempt(*, _retry_state, **kwargs):
+            if not states:
+                _retry_state["compile_result"] = compiled
+            states.append(_retry_state)
+            if len(states) == 2:
+                self.assertIs(kwargs["_reuse_compile_result"], compiled)
+            return failure
+
+        with patch.object(device, "_evaluate_phase_attempt", side_effect=attempt) as attempts:
+            device._evaluate_single_phase()
+            device._evaluate_single_phase()
+        self.assertEqual(attempts.call_count, 3)
+        self.assertIs(states[0], states[1])
+        self.assertIsNot(states[1], states[2])
+        self.assertEqual(states[2], {})
+        self.assertFalse(hasattr(device, "_phase_compile_result"))
+
+    def test_runtime_error_kinds_preserve_retry_and_timeout_policy(self):
+        # Protocol/transport failures permit retry while an actual run timeout penalizes latency.
+        from types import SimpleNamespace
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            device = STM32NucleoN657X0QDevice()
+            compiled = SimpleNamespace(success=True, log="ok", flash_bytes=2,
+                ram_bytes=1, overflow_kind=None, build_dir=root / "Debug", arena_bytes=3)
+            prefix = "crest.microcontrollers.stm32_nucleo_n657x0."
+            with patch.object(device, "compile", return_value=compiled), \
+                 patch(prefix + "stm32_cube_clt.resolve_elf_path", return_value=root / "app.elf"), \
+                 patch(prefix + "stm32_runtime.SerialMonitor"), \
+                 patch(prefix + "stm32_cube_clt.debug_load_elf", return_value="ok"):
+                for kind in sorted(MEASUREMENT_INTEGRITY_KINDS | {"runtime_timeout"}):
+                    with self.subTest(kind=kind), patch(
+                        prefix + "stm32_runtime.execute_runtime_session",
+                        side_effect=stm32_runtime.STM32RuntimeProtocolError(
+                            kind=kind, detail="failed", serial_log=[])):
+                        result = device._evaluate_single_phase_unchecked(
+                            dirpath=root / "unstaged", arena_kb=-1, window_size=200,
+                            num_channels=10, serial_port="fake")
+                        expected = HIL_ERROR_LATENCY if kind == "runtime_timeout" else HIL_ERROR_INTEGRITY
+                        self.assertEqual(result.error_code, expected)
+                        self.assertEqual(result.power_metrics["backend_error_kind"], kind)
