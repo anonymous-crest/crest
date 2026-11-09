@@ -126,3 +126,8 @@ Important exceptions and separately governed materials
 - OxIOD split metadata and upstream OxIOD readme snippets are dataset-related materials.
   Raw OxIOD data is downloaded separately and is not stored in this repository.
 - UrbanSound8K downloaded audio and generated feature caches are governed by the UrbanSound8K dataset terms and are not stored in this repository.
+
+## Anonymous Review Note
+
+Citation, acknowledgments, and identifying project metadata are intentionally omitted or anonymized while this artifact is prepared for double-blind review.
+For the public release, the project metadata, citation information, acknowledgments, and non-anonymous provenance will be restored.
