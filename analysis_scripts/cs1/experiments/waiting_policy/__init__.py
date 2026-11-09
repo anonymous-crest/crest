@@ -1,0 +1,3 @@
+# Copyright (c) 2026 Anonymous Authors
+# SPDX-License-Identifier: BSD-3-Clause
+"""Frozen-artifact final-slot waiting-policy preparation and orchestration."""

@@ -3,56 +3,64 @@ Copyright (c) 2026 Anonymous Authors
 SPDX-License-Identifier: BSD-3-Clause
 -->
 
-# Case Study Configs
+# Case-study experiments
 
-These configs preserve the run axes used by the CREST case studies. Use the
-top-level configs in `src/config/` as general starting points; use this folder
-when you want the case-study device, workload, runtime-mode, and scoring
-combinations.
+This directory contains portable copies of saved experiment configurations, grouped into three case studies covering runtime schedules, cross-target selection, and audio proposal strategies.
+Each YAML header includes its launch command, run from the repository root with the `crest` environment active.
+Dataset, device, network, output, and firmware paths are adjusted for this checkout, while search objectives, budgets, precision choices, and proposal policies retain their saved values.
+Use these for new studies after preparing data and setting device ports using the [getting-started guide](../../GETTING_STARTED.md).
+Use the [general example configs](../README.md#example-configs) as the simpler starting point for a new application.
 
-Each YAML includes its intended launch command near the top. Run commands from
-the repository root with the `crest` environment active.
+These configurations do not recreate historical firmware, trained models, or saved measurements.
+Use fresh study names and output directories rather than resuming an archived study with changed paths or runtime versions.
 
-## Case Study 1: OxIOD TCN Across Targets
+## Case study 1 STM32 runtime schedule comparison
 
-Hardware requirement: target development board and HIL harness required for
-the measured-energy configs in this folder.
+All six configurations use OxIOD and the STM32 N657.
+Continuous and periodic identify the energy objective, not necessarily the measurement mode.
+The 100 and 500 ms searches collect both measurement phases even when scoring continuous energy.
 
-- [`nas_config_case1_2_ble33_b2b_oxiod.yaml`](nas_config_case1_2_ble33_b2b_oxiod.yaml)
-  Arduino Nano 33 BLE Sense, OxIOD, back-to-back runtime.
-- [`nas_config_case1_3_portenta_m7_b2b_oxiod.yaml`](nas_config_case1_3_portenta_m7_b2b_oxiod.yaml)
-  Portenta H7 CM7, OxIOD, back-to-back runtime.
-- [`nas_config_case1_4_portenta_m4_b2b_oxiod.yaml`](nas_config_case1_4_portenta_m4_b2b_oxiod.yaml)
-  Portenta H7 CM4, OxIOD, back-to-back runtime.
-- [`nas_config_case1_5_stm32_b2b_oxiod.yaml`](nas_config_case1_5_stm32_b2b_oxiod.yaml)
-  NUCLEO-N657X0-Q, OxIOD, back-to-back runtime.
+| Release period | Continuous-energy objective | Periodic-energy objective |
+| --- | --- | --- |
+| 100 ms | [Continuous](cs1/stm32_continuous_100ms.yaml) | [Periodic](cs1/stm32_periodic_100ms.yaml) |
+| 200 ms | [Continuous](cs1/stm32_continuous_200ms.yaml) | [Periodic](cs1/stm32_periodic_200ms.yaml) |
+| 500 ms | [Continuous](cs1/stm32_continuous_500ms.yaml) | [Periodic](cs1/stm32_periodic_500ms.yaml) |
 
-The desktop proxy examples for the same OxIOD path live one directory up:
-[`../nas_config_flops_rmse.yaml`](../nas_config_flops_rmse.yaml) and
-[`../nas_config_memory_proxy.yaml`](../nas_config_memory_proxy.yaml). Those
-proxy configs do not require hardware.
+The 100 and 500 ms campaigns use int8 and a 256-attempt cap.
+The older 200 ms configurations search float and int8 and retain their saved 600-attempt cap, although the corresponding analysis uses only the first 256 attempts.
+The 200 ms periodic campaign used earlier firmware with per-slot UART output and is excluded from the corresponding model and selection analyses.
+Current firmware runs cannot reproduce that historical measurement protocol from YAML alone.
 
-## Case Study 2: STM32 Runtime Schedule Comparison
+## Case study 2 OxIOD TCN across targets
 
-Hardware requirement: NUCLEO-N657X0-Q board required; HIL harness required for
-energy-measured runs.
+The two proxy searches use mixed float/int8 precision and require no board.
+The four measured-energy searches require the corresponding target and measurement harness.
 
-- [`nas_config_case2_1_stm32_b2b_oxiod.yaml`](nas_config_case2_1_stm32_b2b_oxiod.yaml)
-  NUCLEO-N657X0-Q, OxIOD, continuous back-to-back runtime.
-- [`nas_config_case2_2_stm32_cadenced_oxiod.yaml`](nas_config_case2_2_stm32_cadenced_oxiod.yaml)
-  NUCLEO-N657X0-Q, OxIOD, cadenced sensing-window runtime with cadence-aware
-  feasibility constraints.
+| Experiment | Configuration |
+| --- | --- |
+| FLOPs proxy | [OxIOD FLOPs](cs2/oxiod_flops_proxy.yaml) |
+| Memory-traffic proxy | [OxIOD memory](cs2/oxiod_memory_proxy.yaml) |
+| Nano 33 BLE Sense measured energy | [BLE](cs2/oxiod_ble_measured_energy.yaml) |
+| Portenta H7 CM4 measured energy | [CM4](cs2/oxiod_portenta_m4_measured_energy.yaml) |
+| Portenta H7 CM7 measured energy | [CM7](cs2/oxiod_portenta_m7_measured_energy.yaml) |
+| STM32 N657 measured energy and clock search | [STM32](cs2/oxiod_stm32_measured_energy.yaml) |
 
-## Case Study 3: UrbanSound8K DS-CNN Application Scoring
+These configurations retain the saved campaigns’ precision choices and budgets.
+The [general FLOPs and memory examples](../README.md#example-configs) use different precision settings.
+For cross-target evaluation of selected candidates, use [Pareto HIL replay](../../README.md#pareto-hil-replay).
 
-Hardware requirement: target board and HIL harness required as shipped. For
-hardware-free training, use these configs as templates with HIL and measured
-scoring disabled.
+## Case study 3 UrbanSound8K DS-CNN application scoring
 
-- [`nas_config_case3_1_portenta_m7_audio.yaml`](nas_config_case3_1_portenta_m7_audio.yaml)
-  Portenta H7 CM7, UrbanSound8K cached log-mel inputs, DS-CNN family.
-- [`nas_config_case3_2_stm32_audio.yaml`](nas_config_case3_2_stm32_audio.yaml)
-  NUCLEO-N657X0-Q, UrbanSound8K cached log-mel inputs, DS-CNN family.
+All six campaigns score validation macro-F1 and continuous energy using the same application score.
+Portenta TPE collects continuous measurements only, while the other campaigns also collect periodic measurements.
+Their recorded elapsed times therefore include different measurement work.
 
-For the full config schema and scoring policy reference, see
-[`../README.md`](../README.md).
+| Target | TPE | Memory | History |
+| --- | --- | --- | --- |
+| Portenta H7 CM7 | [TPE](cs3/audio_portenta_tpe.yaml) | [Memory](cs3/audio_portenta_memory.yaml) | [History](cs3/audio_portenta_history.yaml) |
+| STM32 N657 | [TPE](cs3/audio_stm32_tpe.yaml) | [Memory](cs3/audio_stm32_memory.yaml) | [History](cs3/audio_stm32_history.yaml) |
+
+Memory and History use the same [15 warm-up candidates](cs3/warmup_params.json) before provider calls.
+Keep that file beside the YAMLs.
+For live credentials and provider access, follow the [LLM guide](../../crest/optimizers/llm/README.md#run-an-experiment).
+The saved model choice is retained, but provider availability and nondeterministic responses can affect a new run.

@@ -3,426 +3,174 @@ Copyright (c) 2026 Anonymous Authors
 SPDX-License-Identifier: BSD-3-Clause
 -->
 
-# Source Guide
+# Source guide
 
-This directory contains the Python entry points and core library code for the
-CREST training, hardware-in-the-loop, and deployment flow.
+This directory contains the Python entry points and core library code for the CREST training, hardware-in-the-loop, and deployment flow.
 
-This guide maps the training, HIL, and extension surfaces under `src/`.
+For installation and runnable workflows, see [Getting started](GETTING_STARTED.md).
+For contribution standards and test commands, see [Contributing](../CONTRIBUTING.md).
 
-Related docs:
-
-- Repository setup, dataset preparation, and operator workflow live in
-  [`../README.md`](../README.md).
-- Config block meanings, NAS policy shape, and runtime config caveats live in
-  [`config/README.md`](config/README.md).
-- Microcontroller and hardware-backend bring-up live in
-  [`crest/microcontrollers/README.md`](crest/microcontrollers/README.md).
-
-## Where To Start
+## Where to start
 
 | Goal | Start Here | Hardware Requirement |
 |------|------------|----------------------|
 | Run or modify NAS/training orchestration | [`nas_model_client.py`](nas_model_client.py) and [`crest/runtime_bootstrap.py`](crest/runtime_bootstrap.py) | No hardware required when `device.hil: false` |
-| Run or modify HIL server behavior | [`hil_server.py`](hil_server.py) and [`crest/hil_runtime.py`](crest/hil_runtime.py) | Development board required for execution; HIL harness required for energy measurement |
+| Add a proposer or inspect the shared optimizer flow | [Optimizer system guide](crest/optimizers/README.md) and [shared contracts](#shared-contracts) | No hardware required for contract checks |
+| Modify LLM candidate generation | [`crest/optimizers/llm/`](crest/optimizers/llm) and [optimizer config](config/README.md#optimizer) | No hardware required for fake-provider tests |
+| Run or modify HIL server behavior | [`hil_server.py`](hil_server.py) and [`crest/hil/runtime.py`](crest/hil/runtime.py) | Development board required for execution. HIL harness required for energy measurement |
 | Add a dataset | [`crest/datasets/README.md`](crest/datasets/README.md) | No hardware required for adapter development |
 | Add a task | [`crest/tasks/README.md`](crest/tasks/README.md) | No hardware required for adapter development |
-| Add a model family | [`crest/model_families/README.md`](crest/model_families/README.md) | No hardware required for model construction; hardware needed for backend validation |
+| Add a model family | [`crest/model_families/README.md`](crest/model_families/README.md) | No hardware required for model construction. Hardware needed for backend validation |
 | Add board support | [`crest/microcontrollers/README.md`](crest/microcontrollers/README.md) | Matching board and toolchain required |
 
-## Top-Level Entry Points
-
-- [`nas_model_client.py`](nas_model_client.py)
-  Runs NAS, training, scoring, artifact export, and the client side of the
-  hardware-in-the-loop workflow.
-- [`hil_server.py`](hil_server.py)
-  Runs the ZeroMQ HIL server that materializes models, stages device-specific
-  candidates, and returns compile/runtime metrics.
-- [`pareto_hil_replay.py`](pareto_hil_replay.py)
-  Replays already-logged Pareto-front NAS candidates through a target HIL
-  config and writes replay artifacts.
-
-## Package Map
-
-The `crest/` package holds the reusable implementation behind the entry
-points above.
-
-- [`crest/component_selection.py`](crest/component_selection.py)
-  Resolves the active dataset, task, and model-family selections from config.
-- [`crest/registry.py`](crest/registry.py)
-  Defines the string-keyed registries for datasets, tasks, and model families.
-- [`crest/builtin_components.py`](crest/builtin_components.py)
-  Registers the built-in dataset, task, and model-family implementations.
-- [`crest/interfaces.py`](crest/interfaces.py)
-  Defines the core abstraction contracts:
-  `DatasetABC`, `TaskABC`, and `ModelFamilyABC`.
-- [`crest/pipeline_types.py`](crest/pipeline_types.py)
-  Defines shared typed payloads passed between the modular pipeline layers.
-- [`crest/datasets/`](crest/datasets)
-  Dataset adapters. Built-ins include [`oxiod.py`](crest/datasets/oxiod.py)
-  and [`urbansound8k_mel.py`](crest/datasets/urbansound8k_mel.py). See
-  [`crest/datasets/README.md`](crest/datasets/README.md) for the contributor
-  guide.
-- [`crest/tasks/`](crest/tasks)
-  Task adapters. Built-ins include
-  [`odometry_regression.py`](crest/tasks/odometry_regression.py) and
-  [`sound_classification.py`](crest/tasks/sound_classification.py). See
-  [`crest/tasks/README.md`](crest/tasks/README.md) for the contributor guide.
-- [`crest/model_families/`](crest/model_families)
-  Model-family implementations. Built-ins include
-  [`odom_tcn.py`](crest/model_families/odom_tcn.py) and
-  [`audio_dscnn.py`](crest/model_families/audio_dscnn.py). See
-  [`crest/model_families/README.md`](crest/model_families/README.md) for the
-  contributor guide.
-- [`crest/microcontrollers/`](crest/microcontrollers)
-  Hardware backends and backend registry/factory logic. See
-  [`crest/microcontrollers/README.md`](crest/microcontrollers/README.md)
-  for bring-up details.
-- [`crest/model.py`](crest/model.py)
-  Shared runtime helpers for config loading, score evaluation, and generic
-  metric normalization.
-- [`crest/runtime_bootstrap.py`](crest/runtime_bootstrap.py)
-  Shared task-aware bootstrap path used by both `nas_model_client.py` and
-  `hil_server.py` to resolve component selection, instantiate dataset/task/
-  family components, and validate NAS policy against the active task contract.
-- [`crest/hil_runtime.py`](crest/hil_runtime.py)
-  Runtime-owned HIL request construction and metric collection helpers used by
-  the HIL server and related tests.
-- [`crest/pareto_replay.py`](crest/pareto_replay.py)
-  Reusable Pareto replay selection, request reconstruction, resume, manifest,
-  and result-writing logic behind `pareto_hil_replay.py`.
-- [`crest/devices.py`](crest/devices.py)
-  Shared device dataclasses and the `DeviceInterface` contract used by
-  hardware backends.
-- [`crest/hardware.py`](crest/hardware.py)
-  Legacy/shared hardware utility layer used by the current HIL/NAS flow.
-
-## Shared Abstractions
-
-The modular runtime is built around three main interfaces plus a small set of
-typed payloads shared across orchestration code.
-
-- `DatasetABC` in [`crest/interfaces.py`](crest/interfaces.py)
-  Loads raw data and returns a normalized [`DatasetBundle`](crest/pipeline_types.py)
-  with train/validation/test/calibration splits plus dataset metadata.
-- `TaskABC` in [`crest/interfaces.py`](crest/interfaces.py)
-  Defines the target/output contract, task-owned fitting behavior, evaluation
-  behavior, and the metric contract that shared NAS/scoring code consumes.
-- `ModelFamilyABC` in [`crest/interfaces.py`](crest/interfaces.py)
-  Samples hyperparameters, builds models, validates family-local config, and
-  materializes the export variant passed into HIL.
-- Shared typed payloads in [`crest/pipeline_types.py`](crest/pipeline_types.py)
-  carry the normalized information exchanged between those layers:
-  `DatasetBundle`, `TargetSpec`, `ModelBuildContext`, `FitPlan`,
-  `EvaluationResult`, and `TaskMetricContract`.
-
-## End-to-End Flow
-
-At a high level, the source tree is wired like this:
-
-1. `nas_model_client.py` or `hil_server.py` loads
-   [`config/nas_config_stm32.yaml`](config/nas_config_stm32.yaml) through shared helpers in
-   [`crest/model.py`](crest/model.py).
-2. The entry point calls
-   `ensure_builtin_components_registered()` from
-   [`crest/builtin_components.py`](crest/builtin_components.py) so the
-   default dataset, task, and model family are available by name.
-3. The entry point runs the shared bootstrap in
-   [`crest/runtime_bootstrap.py`](crest/runtime_bootstrap.py), which
-   resolves component selection, instantiates the selected dataset/task/model
-   family, derives the target spec, and validates `nas.score`, `nas.prune`,
-   and `nas.feasibility` against the task metric contract.
-4. The selected dataset adapter loads data and produces a normalized
-   `DatasetBundle`.
-5. The selected task adapter builds the target contract and training/evaluation
-   behavior.
-6. The selected model family samples hyperparameters, builds models, and
-   materializes export variants.
-7. When hardware metrics are needed, the HIL path builds a normalized request
-   through [`crest/hil_runtime.py`](crest/hil_runtime.py), then the
-   selected microcontroller backend stages, compiles, uploads, and measures
-   one candidate.
-8. Shared scoring, pruning, and result-shaping code combines task metrics and
-   backend metrics into the values used by NAS and reporting.
-
-That split is important:
-
-- Dataset/task/model-family code owns the ML-side behavior.
-- Microcontroller backend code owns the build/upload/runtime measurement path.
-- The top-level scripts own orchestration and policy.
-
-NAS and HIL both use the same component-selection path. The same config-driven
-dataset/task/model-family selection is resolved before the code branches into
-training/NAS behavior or board/backend behavior.
+## Top-Level entry points
+
+- [`nas_model_client.py`](nas_model_client.py) Runs NAS, training, scoring, artifact export, and the client side of the hardware-in-the-loop workflow.
+- [`hil_server.py`](hil_server.py) Runs the ZeroMQ HIL server that materializes models, stages device-specific candidates, and returns compile/runtime metrics.
+- [`pareto_hil_replay.py`](pareto_hil_replay.py) Replays already-logged Pareto-front NAS candidates through a target HIL config and writes replay artifacts.
+
+## Package map
+
+| Area | Responsibility |
+| --- | --- |
+| [`crest/component_selection.py`](crest/component_selection.py), [`registry.py`](crest/registry.py), [`builtin_components.py`](crest/builtin_components.py) | Resolve configured names and register components |
+| [Shared contracts](#shared-contracts), [`pipeline_types.py`](crest/pipeline_types.py) | Component contracts and shared records |
+| [`crest/datasets/`](crest/datasets/README.md) | Data loading, splits, and calibration data |
+| [`crest/tasks/`](crest/tasks/README.md) | Training, evaluation, and task metrics |
+| [`crest/model_families/`](crest/model_families/README.md) | Search spaces, model construction, and export variants |
+| [`crest/optimizers/`](crest/optimizers/README.md) | Candidate proposals and shared round execution |
+| [`crest/search/`](crest/optimizers/README.md#progress-and-reproducibility) | Progress reporting and training randomness |
+| [`crest/hil/`](crest/hil), [`microcontrollers/`](crest/microcontrollers/README.md) | Hardware requests, measurement, and board backends |
+| [`crest/model.py`](crest/model.py), [`runtime_bootstrap.py`](crest/runtime_bootstrap.py) | Configuration, scoring, and component initialization |
+| [`crest/pareto_replay.py`](crest/pareto_replay.py) | Candidate selection and request reconstruction for Pareto HIL replay |
+| [`crest/devices.py`](crest/devices.py), [`hardware.py`](crest/hardware.py) | Device contracts and shared hardware utilities |
+
+## Shared contracts
 
-## Component Selection
-
-The current modular selection surface is resolved in
-[`crest/component_selection.py`](crest/component_selection.py).
+The `crest` package implements the reusable pipeline behind the source entry points.
+Use canonical imports such as `from crest.pipeline_types import ModelBuildContext`.
+Dependencies are declared in [`../pyproject.toml`](../pyproject.toml).
+Runtime modules may require TensorFlow, Optuna, serial libraries, or board toolchains.
+
+| Module | Contract | Implementation guide |
+| --- | --- | --- |
+| [`dataset.py`](crest/interfaces/dataset.py) | `DatasetABC` loads and validates data and supplies calibration inputs | [Datasets](crest/datasets/README.md) |
+| [`task.py`](crest/interfaces/task.py) | `TaskABC` owns training, evaluation, and metrics | [Tasks](crest/tasks/README.md) |
+| [`model_family.py`](crest/interfaces/model_family.py) | `ModelFamilyABC` samples, builds, and exports architectures | [Model families](crest/model_families/README.md) |
+| [`optimizer.py`](crest/interfaces/optimizer.py) | `OptimizerABC` owns proposal rounds and resume identity | [Optimizers](crest/optimizers/README.md) |
+
+Import contracts through the package exports.
+
+```python
+from crest.interfaces import DatasetABC, TaskABC, ModelFamilyABC, OptimizerABC
+from crest.interfaces import OptimizerBudgetExhausted
+```
+
+`OptimizerBudgetExhausted` signals that an optimizer-owned budget cannot fund another round.
+Shared input/output records live in [`crest/pipeline_types.py`](crest/pipeline_types.py), including splits, target specifications, model contexts, evaluation results, history, budgets, and proposals.
+The contracts can be inspected without loading TensorFlow or device backends.
+Method docstrings specify required overrides and default behavior.
+
+### Required hooks and defaults
+
+| Contract | Required methods |
+| --- | --- |
+| `DatasetABC` | `load` |
+| `TaskABC` | `build_target_spec`, `metric_contract`, `compile_model`, `build_fit_plan`, `evaluate`, `evaluate_predictions` |
+| `ModelFamilyABC` | `sample_hparams`, `build_model` |
+| `OptimizerABC` | `propose_round` |
+
+Implement abstract methods first and override defaults only when needed.
+Some execution modes require optional hooks.
+An explicit proposer needs the model family's `trial_search_space` declaration, while native sampling can work without it.
+
+### Inspect an implementation's obligations
+
+This example needs no dataset, model, provider, or TensorFlow import.
+
+```python
+from crest.interfaces import ModelFamilyABC
+
+print(sorted(ModelFamilyABC.__abstractmethods__))
+# ['build_model', 'sample_hparams']
+```
+
+A subclass with an unimplemented abstract method cannot be instantiated.
+Implementing those methods alone does not establish compatibility with a selected task, dataset, or deployment mode.
+
+## End-to-End flow
+
+1. An entry point loads configuration and resolves the selected dataset, task, model family, and optimizer.
+2. The dataset supplies splits and metadata.
+   The task defines outputs, fitting, evaluation, and available metrics.
+3. The optimizer requests native sampling or proposes explicit parameters.
+   The shared runner manages trials and budgets and evaluates candidates through the same objective.
+4. The model family builds and exports each candidate.
+   When hardware metrics are needed, the selected backend stages, compiles, uploads, and measures it.
+5. Shared scoring combines task and hardware metrics for search and reporting.
+
+NAS and the HIL server share component initialization through [`runtime_bootstrap.py`](crest/runtime_bootstrap.py).
+
+## Registration model
+
+Registration is explicit.
+Adding a Python file does not make a component selectable.
+Built-ins are registered in [`crest/builtin_components.py`](crest/builtin_components.py).
+Register custom classes under stable keys in [`crest/registry.py`](crest/registry.py) before loading configuration.
+Select them through `dataset.name`, `task.name`, `model.family`, or `optimizer.type`.
+Follow the matching component guide's extension steps and completion checks, including small inputs and invalid configurations before a full search.
+
+Native sampling and explicit LLM proposals use the same objective, feasibility rules, and evaluation budget.
+The runner validates complete explicit batches before queueing them.
+See the [optimizer guide](crest/optimizers/README.md) for the proposal contract and [LLM guide](crest/optimizers/llm/README.md) for provider examples.
+
+## Trial outputs
 
-The main config knobs are:
+CSV output includes study identity, objectives, hardware measurements, pruning, and feasibility status.
+Task metrics use `metric__{name}` columns and hyperparameters use `hparam__{name}`.
+The corresponding values also appear in Optuna trial attributes.
+For analysis, use the [trial-outcome guide](../analysis_scripts/appendix_trial_outcomes/README.md).
 
-- `dataset.name`
-  Selects the dataset adapter.
-- `dataset.params`
-  Required dataset-local config block.
-- `task.name`
-  Selects the task adapter.
-- `task.params`
-  Optional task-local config block.
-- `model.family`
-  Selects the model family.
-- `model.params`
-  Model-family-local configuration.
-- `model.search`
-  Model-family-local search-space configuration.
+## Pareto HIL replay
 
-`dataset`, `task`, and `model` are required blocks. The older top-level
-`data` fallback is not part of the supported config contract anymore.
+`pareto_hil_replay.py` does not run NAS or retrain models.
+It reads a source NAS CSV/config, reconstructs the logged candidate payloads, selects the valid Pareto front, and reuses the same HIL server/backend request path that normal hardware scoring uses.
 
-See [`config/README.md`](config/README.md) for the current shipped config shape.
+Use `--dry-run` as a hardware-free preflight.
+It writes `manifest.json`, `replay_requests.jsonl`, and `replay_results.csv` without accessing hardware.
+Review these requests before running against a board.
+Hardware execution uses the saved candidate parameters and any model/checkpoint overrides you supply.
 
-## Registration Model
+`--resume` skips payload keys already present in `replay_results.csv` with `completed` or `dry_run` status.
+Do not reuse a dry-run output directory for a hardware replay with `--resume` unless skipping those candidates is intentional.
 
-CREST does not currently auto-discover components from the filesystem.
-The registry model is explicit:
+## Change an interface
 
-- [`crest/registry.py`](crest/registry.py) defines
-  `dataset_registry`, `task_registry`, and `model_family_registry`.
-- [`crest/builtin_components.py`](crest/builtin_components.py) registers
-  the built-in components under their stable string keys.
-- The entry points call `ensure_builtin_components_registered()` before they
-  resolve component names from config.
+1. Read the method contract and all affected implementations before changing a hook.
+   Put shared records in [`crest/pipeline_types.py`](crest/pipeline_types.py) and keep interfaces independent of concrete implementations.
+2. Prefer a useful default when possible.
+   A new abstract hook requires every subclass, including third-party components, to implement it.
+3. Update module docstrings, implementations, component guides, and migration instructions together.
+   Preserve package exports in `crest/interfaces/__init__.py`.
+4. Run interface compatibility and affected component tests from the repository root.
+   Run the full suite when changing shared signatures or defaults.
 
-If you add a new dataset, task, or model family, it is not available until
-something registers it under the name you intend to use in config.
+### Completion checks
 
-## Shared Scoring And Trial Outputs
+- Required hooks, return types, defaults, and failure behavior are documented.
+- Public imports resolve to the exported classes without initializing ML runtimes or concrete backends.
+- Existing implementations instantiate and have behavior covered by tests.
+- Intentional compatibility changes have an explicit migration path.
+- Examples, registration instructions, and links match the source layout.
 
-The shared score/logging path no longer assumes one fixed model shape
-or one fixed metric schema.
+```bash
+python -m pytest test/test_interfaces_package.py test/test_modularity_scaffolding.py
+```
 
-### Task Metric Declaration
-
-[`TaskMetricContract`](crest/pipeline_types.py) is the task-owned
-declaration shared with orchestration code. It tells the shared pipeline:
-
-- which metrics the task can produce
-- which metrics only exist after full training
-- which metrics are guaranteed nonnegative
-- which metrics are the task's primary headline metrics
-
-This is how the task layer advertises metrics such as `rmse_total` without
-hardcoding them into the shared NAS/logging layer.
-
-### Task-Owned Fit And Closeout Hooks
-
-`TaskABC` now owns both fit-plan construction and task-specific closeout hooks.
-
-- `build_fit_plan(...)`
-  Returns the `FitPlan` used by NAS-time training and final retraining,
-  including the `combine_train_val=True` path.
-- `history_component_keys(...)`
-  Advertises which per-output training curves should be plotted for the active
-  task.
-- `generate_closeout_artifacts(...)`
-  Produces task-specific closeout artifacts without forcing generic NAS code to
-  assume odometry trajectory reporting.
-
-### Score Resolution
-
-[`ScoreEvaluationResult`](crest/model.py) is the shared representation of
-the resolved score/objective values for one trial.
-
-- Scalar runs set `score` and leave the objective lists as the configured
-  single-objective projection.
-- Multi-objective runs leave `score` as `None` and instead carry ordered
-  objective names, values, and directions.
-
-### Generic Trial Outcome
-
-[`TrialOutcome`](crest/model.py) is the generic payload written to CSV and
-mirrored into Optuna trial attributes. It carries:
-
-- resolved scalar/objective values
-- `task_metrics`
-- resolved trial `hyperparams`
-- optional task-owned `artifact_summary`
-
-The shared logging code does not need to know which task or model family
-produced those values.
-
-### CSV And Optuna Logging
-
-[`log_trial(...)`](crest/model.py) writes a stable infrastructure column set
-plus dynamic task/hyperparameter columns.
-
-Stable shared columns include:
-
-- study/timestamp fields
-- shared hardware metrics such as RAM, flash, latency, power, energy, and
-  error codes
-- score/objective metadata (`score_type`, `objective_*_json`)
-- pruning metadata
-- feasibility metadata and signed Optuna constraints
-- `artifact_summary_json`
-- cadenced runtime telemetry fields when present
-
-Dynamic columns are added per trial outcome:
-
-- task metrics become `metric__{name}`
-- hyperparameters become `hparam__{name}`
-
-The same information is also mirrored into `trial.user_attrs`, including the
-fully expanded `metric__*` and `hparam__*` keys.
-
-## Pareto HIL Replay
-
-`pareto_hil_replay.py` does not run NAS or retrain models. It reads a source
-NAS CSV/config, reconstructs the logged candidate payloads, selects the valid
-Pareto front, and reuses the same HIL server/backend request path that normal
-hardware scoring uses.
-
-Use `--dry-run` as a hardware-free preflight; it writes `manifest.json`,
-`replay_requests.jsonl`, and `replay_results.csv` without instantiating
-`HILServer`. For hardware execution, the command forwards reconstructed
-`family_hparams`, `runtime_metadata`, `quantization_mode`, optional preserved
-device options, and optional CLI model/checkpoint overrides to HIL.
-
-`--resume` skips payload keys already present in `replay_results.csv` with
-`completed` or `dry_run` status. Do not reuse a dry-run output directory for a
-hardware replay with `--resume` unless skipping those candidates is intentional.
-
-## Extension Paths
-
-Contributor standards for new implementation work:
-
-- Make breaking config or API changes explicit in the relevant README and
-  config examples.
-- Avoid temporary compatibility paths unless they have a tracked owner and
-  removal point.
-- Keep new helpers small, readable, locally validated, and documented with
-  NumPy-style docstrings for changed functions, classes, dataclasses, and
-  tests.
-- Keep non-obvious logic commented, especially feature caching, score/cadence
-  derivation, export/materialization, and hardware staging decisions.
-- Keep code testable without hardware where possible; hardware flows should
-  expose non-hardware preflight checks for config, model construction, export,
-  and generated requests.
-- Pin or justify dependency additions in the implementation plan that adds
-  them.
-
-### Add A New Model Family
-
-If you mean a new trainable/exportable model family, this is the primary
-extension path in the current codebase.
-
-Key files:
-
-- [`crest/interfaces.py`](crest/interfaces.py)
-  `ModelFamilyABC` defines the contract.
-- [`crest/model_families/odom_tcn.py`](crest/model_families/odom_tcn.py)
-  Concrete example of the built-in odometry TCN family.
-- [`crest/model_families/audio_dscnn.py`](crest/model_families/audio_dscnn.py)
-  Concrete example of a built-in classification family over cached log-mel
-  tensors.
-- [`crest/builtin_components.py`](crest/builtin_components.py)
-  Built-in registration.
-- [`crest/component_selection.py`](crest/component_selection.py)
-  Explicit config selection for dataset, task, and model-family components.
-- [`hil_server.py`](hil_server.py) and
-  [`nas_model_client.py`](nas_model_client.py)
-  Entry-point orchestration that consumes the selected family.
-
-Typical steps:
-
-1. Add a new module under [`crest/model_families/`](crest/model_families).
-2. Implement a `ModelFamilyABC` subclass.
-3. Register it in the appropriate registry path.
-   The built-in pattern today is
-   [`crest/builtin_components.py`](crest/builtin_components.py).
-4. Set `model.family` in config to the registered name.
-5. Put family-local knobs under `model.params` and `model.search` when needed.
-6. Verify export/materialization semantics if the family needs custom model
-   loading, custom objects, or variant handling.
-
-Important boundary:
-
-- Model families own model construction and export-oriented materialization.
-- Hardware backends own candidate staging, compile, upload, and runtime
-  measurement.
-
-### Add A New Dataset
-
-Key files:
-
-- [`crest/datasets/README.md`](crest/datasets/README.md)
-  for the full contributor guide
-- [`crest/interfaces.py`](crest/interfaces.py) for `DatasetABC`
-- [`crest/datasets/oxiod.py`](crest/datasets/oxiod.py) and
-  [`crest/datasets/urbansound8k_mel.py`](crest/datasets/urbansound8k_mel.py)
-  as built-in examples
-- [`crest/builtin_components.py`](crest/builtin_components.py) for the
-  current registration pattern
-
-Typical steps:
-
-1. Add a new dataset adapter under [`crest/datasets/`](crest/datasets).
-2. Implement `DatasetABC`.
-3. Register it under a stable string key.
-4. Select it with `dataset.name`.
-5. Put dataset-local knobs under `dataset.params`.
-
-### Add A New Task
-
-Key files:
-
-- [`crest/tasks/README.md`](crest/tasks/README.md)
-  for the full contributor guide
-- [`crest/interfaces.py`](crest/interfaces.py) for `TaskABC`
-- [`crest/tasks/odometry_regression.py`](crest/tasks/odometry_regression.py)
-  and [`crest/tasks/sound_classification.py`](crest/tasks/sound_classification.py)
-  as built-in examples
-- [`crest/builtin_components.py`](crest/builtin_components.py) for the
-  current registration pattern
-
-Typical steps:
-
-1. Add a new task adapter under [`crest/tasks/`](crest/tasks).
-2. Implement `TaskABC`.
-3. Register it under a stable string key.
-4. Select it with `task.name`.
-5. Keep task-owned training, evaluation, and metric-contract logic inside the
-   task adapter.
-
-### Add A New Microcontroller Or Hardware Backend
-
-Key files:
-
-- [`crest/microcontrollers/README.md`](crest/microcontrollers/README.md)
-  for the bring-up guide
-- [`crest/devices.py`](crest/devices.py) for `DeviceInterface`
-- [`crest/microcontrollers/__init__.py`](crest/microcontrollers/__init__.py)
-  for backend registration/factory plumbing
-
-That path is intentionally separate from model-family work. Board bring-up,
-toolchain integration, upload flow, runtime telemetry, and backend-owned
-device options belong to the microcontroller backend layer, not to
-`ModelFamilyABC`.
-
-Important caveat:
-
-- A new non-Arduino backend must be wired into the registry metadata in
-  [`crest/microcontrollers/__init__.py`](crest/microcontrollers/__init__.py)
-  or it is unreachable except through the Arduino FQBN fallback path.
-
-## NAS Policy And HIL Details
-
-For the current scoring, pruning, and runtime knobs, use:
-
-- [`config/README.md`](config/README.md) for the config reference
-- [`config/nas_config_stm32.yaml`](config/nas_config_stm32.yaml) for the STM32 config shape
-- [`crest/model.py`](crest/model.py) for score/prune/feasibility
-  evaluation and HIL request construction
-- [`hil_server.py`](hil_server.py) for the HIL-side request handling and
-  backend failure shaping
+### Contract troubleshooting
+
+- If an abstract class cannot instantiate, inspect `__abstractmethods__` for missing hooks.
+- If a component name is unknown, check registration and its config selector.
+  Importing a contract does not register implementations.
+- If importing contracts loads a runtime unexpectedly, keep framework types under `TYPE_CHECKING` and runtime-dependent imports inside the default hook that needs them.
+- If a component works alone but fails in a study, inspect shared payloads and the selected task, family, and optimizer requirements.

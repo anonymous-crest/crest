@@ -44,7 +44,7 @@ DEFAULT_CONFIG_PATH = Path(__file__).resolve().parents[1] / "config" / "nas_conf
 REPO_ROOT = Path(__file__).resolve().parents[2]
 STM32_DEFAULT_PROJECT_ROOT = (
     REPO_ROOT
-    / "sketches"
+    / "firmware"
     / "stm32"
     / "crest_stm32_lrun"
 )
@@ -73,6 +73,7 @@ VALID_OBJECTIVE_DIRECTIONS = {"maximize", "minimize"}
 VALID_PRUNE_CONDITIONS = {"gt", "gte", "lt", "lte"}
 FEASIBILITY_EQUALITY_EPSILON = 1e-12
 NONNEGATIVE_METRICS = {
+    "measurement_deployment_eligible",
     "ram_bytes",
     "flash_bytes",
     "max_ram_bytes",
@@ -102,6 +103,7 @@ NONNEGATIVE_METRICS = {
     "cadenced_deadline_miss_count",
 }
 INFRASTRUCTURE_SCORE_METRICS = {
+    "measurement_deployment_eligible",
     "ram_bytes",
     "flash_bytes",
     "max_ram_bytes",
@@ -208,6 +210,7 @@ TRIAL_LOG_STABLE_COLUMNS = (
     "score_type",
     "objective_names_json",
     "objective_values_json",
+    "trial_outcome",
     "objective_directions_json",
     "artifact_summary_json",
     "pruned",
@@ -323,8 +326,8 @@ class TrialOutcome:
         runs.
     objective_names : list[str]
         Ordered objective labels.
-    objective_values : list[float]
-        Ordered objective values.
+    objective_values : list[float | None]
+        Ordered objective values; null entries mark failed infrastructure attempts.
     objective_directions : list[str]
         Ordered objective directions matching Optuna conventions.
     task_metrics : dict[str, Any]
@@ -343,8 +346,8 @@ class TrialOutcome:
         runs.
     objective_names : list[str]
         Ordered objective labels.
-    objective_values : list[float]
-        Ordered objective values.
+    objective_values : list[float | None]
+        Ordered objective values; null entries mark failed infrastructure attempts.
     objective_directions : list[str]
         Ordered objective directions matching Optuna conventions.
     task_metrics : dict[str, Any]
@@ -359,7 +362,7 @@ class TrialOutcome:
 
     score: float | None
     objective_names: list[str]
-    objective_values: list[float]
+    objective_values: list[float | None]
     objective_directions: list[str]
     task_metrics: dict[str, Any]
     hyperparams: dict[str, Any]
@@ -999,6 +1002,71 @@ def configured_quantization_mode(config_or_training: Any) -> str:
     if normalized not in VALID_QUANTIZATION_MODES:
         raise ValueError("training.quantization.mode must be one of: float, int8_ptq.")
     return normalized
+
+
+def _normalize_optimizer_config(config: Dict) -> Dict:
+    """Resolve a registered optimizer and validate explicit recovery targets.
+
+    Parameters
+    ----------
+    config : addict.Dict
+        Configuration containing an optional optimizer mapping. A null optimizer
+        selects the default Optuna component.
+
+    Returns
+    -------
+    addict.Dict
+        Component configuration with recovery disabled by default. Recovery
+        targets are distinct nonnegative Optuna trial numbers.
+
+    Raises
+    ------
+    ValueError
+        If the optimizer mapping or its component settings are invalid.
+    """
+    from .component_selection import resolve_optimizer_selection
+
+    raw_optimizer = config.get("optimizer", {})
+    if raw_optimizer is None:
+        raw_optimizer = {}
+    if not isinstance(raw_optimizer, (dict, Dict)):
+        raise ValueError("optimizer must be a mapping when provided.")
+    optimizer = Dict(raw_optimizer)
+    try:
+        optimizer_type, component_cls = resolve_optimizer_selection(optimizer.get("type", "optuna"))
+    except KeyError as exc:
+        raise ValueError(str(exc)) from exc
+    optimizer.type = optimizer_type
+    if "adopt_legacy_study" in optimizer:
+        raise ValueError(
+            "optimizer.adopt_legacy_study is no longer supported. Remove this setting; "
+            "nonempty studies without an optimizer signature require a new study name."
+        )
+    recover = optimizer.get("recover_orphaned_trials", [])
+    if recover is False:
+        recover = []
+    if (not isinstance(recover, list)
+            or any(isinstance(number, bool) or not isinstance(number, int) or number < 0
+                   for number in recover)
+            or len(set(recover)) != len(recover)):
+        raise ValueError(
+            "optimizer.recover_orphaned_trials must be a list of distinct nonnegative "
+            "trial numbers (for example [12]) after confirming those workers have stopped; "
+            "true is unsafe and no longer supported."
+        )
+    optimizer.recover_orphaned_trials = list(recover)
+    if optimizer_type == "llm_generator":
+        # Apply proposal/provider defaults before the component validates its
+        # contract. This only normalizes settings; it does not read credentials
+        # or construct a provider, so loading a config cannot make API calls.
+        from .optimizers.llm.config import normalize_llm_config
+
+        optimizer = normalize_llm_config(optimizer)
+    elif optimizer_type == "optuna":
+        # Preserve the optional compatibility field without invoking LLM rules.
+        optimizer.llm = Dict(optimizer.get("llm", {}))
+    component_cls().validate_config(optimizer)
+    return optimizer
 
 
 def _resolve_metric_value(
@@ -2376,6 +2444,28 @@ def load_config(
         training,
         normalized_device_name,
     )
+    # Custom tariffs travel with the experiment YAML, independent of launch cwd.
+    raw_optimizer = config.get("optimizer", {})
+    raw_llm = raw_optimizer.get("llm", {}) if isinstance(raw_optimizer, dict) else {}
+    pricing_file = raw_llm.get("pricing_file") if isinstance(raw_llm, dict) else None
+    if isinstance(pricing_file, str) and pricing_file.strip():
+        pricing_path = Path(pricing_file).expanduser()
+        if not pricing_path.is_absolute():
+            pricing_path = cfg_path.resolve().parent / pricing_path
+        raw_llm["pricing_file"] = str(pricing_path.resolve())
+    config.optimizer = _normalize_optimizer_config(config)
+    if config.optimizer.type == "llm_generator":
+        # Fixed warm-up candidates belong to the experiment config. Resolve
+        # relative paths beside that YAML file, rather than against the shell
+        # working directory, so launching the same config elsewhere is stable.
+        warmup_file = config.optimizer.llm.get("warmup_params_file")
+        if warmup_file is not None:
+            warmup_path = Path(warmup_file).expanduser()
+            if not warmup_path.is_absolute():
+                warmup_path = cfg_path.resolve().parent / warmup_path
+            # Store a canonical path; the optimizer reads and validates the
+            # candidate contents during initialization, before proposing work.
+            config.optimizer.llm.warmup_params_file = str(warmup_path.resolve())
     # Input mode selects which Arduino sketch variant is used during HIL runs.
     training.input_mode = str(training.get("input_mode", "uniform")).lower()
     config.training.drop_rate_choices = DROP_RATE_CHOICES
@@ -2745,7 +2835,7 @@ def _trial_log_row_mapping(
     dict[str, Any]
         Flat row mapping keyed by CSV column name.
     """
-    score_type = "multi-objective" if trial_outcome.score is None else "scoring-function"
+    score_type = metrics.get("score_type", "multi-objective" if trial_outcome.score is None else "scoring-function")
     mapping: dict[str, Any] = {
         "study_name": study_name,
         "timestamp_unix": time.time(),
@@ -2784,6 +2874,7 @@ def _trial_log_row_mapping(
         "score_type": score_type,
         "objective_names_json": json.dumps(trial_outcome.objective_names),
         "objective_values_json": json.dumps(trial_outcome.objective_values),
+        "trial_outcome": metrics.get("trial_outcome", ""),
         "objective_directions_json": json.dumps(trial_outcome.objective_directions),
         "artifact_summary_json": json.dumps(trial_outcome.artifact_summary, sort_keys=True),
         "pruned": pruned,
@@ -2905,6 +2996,34 @@ def _write_trial_log_append(log_path: Path, header: list[str], row: dict[str, An
         writer.writerow({column: _serialize_csv_cell(row.get(column)) for column in header})
 
 
+def _record_measurement_evidence(metrics: dict[str, Any], trial: TrialLike) -> dict[str, Any]:
+    """Preserve raw-record links and acceptance reasons in trial attrs and CSV.
+
+    Parameters
+    ----------
+    metrics : dict[str, Any]
+        Metrics whose measurement-prefixed entries contain acceptance evidence.
+    trial : TrialLike
+        Trial receiving JSON-safe measurement user attributes.
+
+    Returns
+    -------
+    dict[str, Any]
+        CSV cells keyed by metric-prefixed column names, with lists and mappings
+        serialized as JSON strings.
+    """
+    columns = {}
+    for name, value in metrics.items():
+        if name.startswith("measurement_"):
+            normalized = _normalize_json_safe(value)
+            trial.set_user_attr(name, normalized)
+            columns[f"metric__{name}"] = (
+                json.dumps(normalized, sort_keys=True)
+                if isinstance(normalized, (dict, list)) else normalized
+            )
+    return columns
+
+
 def log_trial(
     trial_outcome: TrialOutcome,
     metrics: dict,
@@ -2956,6 +3075,7 @@ def log_trial(
         prune_reason=prune_reason,
         prune_rule=prune_rule,
     )
+    row_mapping.update(_record_measurement_evidence(metrics, trial))
     metric_columns = sorted(
         column_name
         for column_name in row_mapping
@@ -3055,8 +3175,10 @@ def log_trial(
     trial.set_user_attr("error_code", metrics["error_code"])
     trial.set_user_attr(
         "score_type",
-        "multi-objective" if trial_outcome.score is None else "scoring-function",
+        metrics.get("score_type", "multi-objective" if trial_outcome.score is None else "scoring-function"),
     )
+    if metrics.get("trial_outcome"):
+        trial.set_user_attr("trial_outcome", metrics["trial_outcome"])
     trial.set_user_attr("objective_names", list(trial_outcome.objective_names))
     trial.set_user_attr("objective_values", list(trial_outcome.objective_values))
     trial.set_user_attr("objective_directions", list(trial_outcome.objective_directions))
